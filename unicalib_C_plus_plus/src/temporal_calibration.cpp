@@ -120,7 +120,7 @@ TemporalOffsetResult TemporalOffsetEstimator::estimateFromFeatureVelocity(
   result.num_samples = offsets.size();
   result.converged = result.uncertainty_ms < config_.convergence_threshold_ms;
   
-  LOG_INFO("Temporal offset (feature velocity): {:.2f}ms ± {:.2f}ms, confidence={:.2f}",
+  LOG_INFO_FMT("Temporal offset (feature velocity): %.2fms ± %.2fms, confidence=%.2f",
            result.offset_ms, result.uncertainty_ms, result.confidence);
   
   return result;
@@ -193,7 +193,7 @@ TemporalOffsetResult TemporalOffsetEstimator::estimateFromRotationCorrelation(
   result.num_samples = vel_a.size();
   result.converged = max_corr > 0.8;
   
-  LOG_INFO("Temporal offset (rotation correlation): {:.2f}ms, correlation={:.3f}",
+  LOG_INFO_FMT("Temporal offset (rotation correlation): %.2fms, correlation=%.3f",
            result.offset_ms, max_corr);
   
   return result;
@@ -381,8 +381,7 @@ double TemporalOffsetEstimator::weightedMovingAverage(
 // BSplineTemporalOptimizer
 // =============================================================================
 
-BSplineTemporalOptimizer::BSplineTemporalOptimizer(const Config& config)
-    : config_(config) {}
+// 构造函数已在头文件中内联定义
 
 std::pair<double, double> BSplineTemporalOptimizer::optimize(
     const std::vector<IMUDataPoint>& imu_data,
@@ -424,7 +423,7 @@ std::pair<double, double> BSplineTemporalOptimizer::optimize(
     }
   }
   
-  LOG_INFO("B-spline temporal optimization: offset={:.2f}ms, cost={:.6f}",
+  LOG_INFO_FMT("B-spline temporal optimization: offset=%.2fms, cost=%.6f",
            best_offset * 1000.0, best_cost);
   
   return {best_offset, best_cost};
@@ -434,8 +433,7 @@ std::pair<double, double> BSplineTemporalOptimizer::optimize(
 // TemporalOffsetValidator
 // =============================================================================
 
-TemporalOffsetValidator::TemporalOffsetValidator(const ValidationConfig& config)
-    : config_(config) {}
+// 构造函数已在头文件中内联定义
 
 std::pair<bool, std::string> TemporalOffsetValidator::validate(
     const std::vector<TemporalOffsetResult>& estimates) {
@@ -472,8 +470,8 @@ bool TemporalOffsetValidator::checkTemporalConsistency(
   for (size_t i = 1; i < estimates.size(); ++i) {
     double diff = std::abs(estimates[i].offset_ms - estimates[i-1].offset_ms);
     if (diff > config_.consistency_threshold_ms) {
-      LOG_WARNING("Temporal inconsistency detected: {:.2f}ms between estimates {} and {}",
-                  diff, i-1, i);
+      LOG_WARNING_FMT("Temporal inconsistency detected: %.2fms between estimates %d and %d",
+                  diff, static_cast<int>(i-1), static_cast<int>(i));
       return false;
     }
   }

@@ -72,14 +72,14 @@ IterativeRefiner::refine(
     
     history_.push_back(result);
     
-    LOG_INFO("  [Iter {}/{}] cost={:.6f}, R_change={:.4f}deg, t_change={:.4f}mm",
+    LOG_INFO_FMT("  [Iter %d/%d] cost=%.6f, R_change=%.4fdeg, t_change=%.4fmm",
              iter + 1, config_.max_iterations, cost,
              R_change * 180.0 / M_PI, t_change * 1000.0);
     
     // 检查收敛
     if (checkConvergence(R_change, t_change)) {
       result.converged = true;
-      LOG_INFO("  Converged at iteration {}", iter + 1);
+      LOG_INFO_FMT("  Converged at iteration %d", iter + 1);
       break;
     }
     
@@ -286,7 +286,7 @@ MultiResolutionOptimizer::optimizeMultiresolution(
   
   for (int level = 0; level < levels_; ++level) {
     double knot_distance = base_knot_distance * knot_factors_[level];
-    LOG_INFO("  [Level {}/{}] knot_distance={:.4f}s", 
+    LOG_INFO_FMT("  [Level %d/%d] knot_distance=%.4fs", 
              level + 1, levels_, knot_distance);
     
     // 创建当前层级的代价函数
@@ -305,7 +305,7 @@ MultiResolutionOptimizer::optimizeMultiresolution(
     result.success = true;
     results.push_back(result);
     
-    LOG_INFO("    cost={:.6f}", best_cost);
+    LOG_INFO_FMT("    cost=%.6f", best_cost);
   }
   
   return {params, results};

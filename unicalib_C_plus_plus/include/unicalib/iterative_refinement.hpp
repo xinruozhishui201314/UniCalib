@@ -135,6 +135,11 @@ class IterativeRefiner {
    * @brief 检查是否收敛
    */
   bool isConverged() const { return !history_.empty() && history_.back().converged; }
+  
+  /**
+   * @brief 计算两个旋转矩阵之间的角度距离 (弧度)
+   */
+  static double rotationDistance(const Eigen::Matrix3d& R1, const Eigen::Matrix3d& R2);
 
  private:
   RefinementConfig config_;
@@ -150,11 +155,6 @@ class IterativeRefiner {
       double td,
       CostFunction cost_function,
       std::optional<JacobianFunction> jacobian);
-  
-  /**
-   * @brief 计算两个旋转矩阵之间的角度距离
-   */
-  static double rotationDistance(const Eigen::Matrix3d& R1, const Eigen::Matrix3d& R2);
   
   /**
    * @brief 检查是否收敛
