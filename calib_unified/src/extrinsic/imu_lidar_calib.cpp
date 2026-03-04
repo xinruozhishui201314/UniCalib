@@ -4,6 +4,7 @@
  */
 #include "unicalib/extrinsic/imu_lidar_calib.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/math_safety.h"  // 修复：添加数学安全工具库
 #include <pcl/registration/ndt.h>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
@@ -172,11 +173,30 @@ std::optional<Sophus::SO3d> IMULiDARCalibrator::solve_handeye_rotation(
 
     Eigen::JacobiSVD<Eigen::MatrixXd> svd(M, Eigen::ComputeFullV);
     Eigen::Vector4d q_vec = svd.matrixV().col(3);
-    q_vec.normalize();
-
-    Eigen::Quaterniond q(q_vec[0], q_vec[1], q_vec[2], q_vec[3]);
-    if (q.w() < 0) q.coeffs() = -q.coeffs();
-
+    
+    // 修复 1.1: 安全的四元数归一化
+    bool quat_success = true;
+    Eigen::Quaterniond q;
+    try {
+        q = MathSafety::safeNormalize(q_vec);
+    } catch (const std::runtime_error& e) {
+        UNICALIB_ERROR("[SolveHandeye] 四元数归一化失败: {}", e.what());
+        quat_success = false;
+    }
+    
+    if (!quat_success) {
+        // 四元数接近零，返回单位旋转
+        UNICALIB_WARN("[SolveHandeye] SVD 结果接近零，返回单位旋转");
+        return Sophus::SO3d();
+    }
+    
+    // 修复 1.2: 四元数符号一致性处理
+    if (q.w() < 0) {
+        // 选择正标量的四元数（保持符号一致）
+        UNICALIB_DEBUG("[SolveHandeye] 四元数标量为负，取反");
+        q.coeffs() = -q.coeffs();
+    }
+    
     return Sophus::SO3d(q);
 }
 

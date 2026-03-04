@@ -47,6 +47,7 @@ option(UNICALIB_WITH_ROS2       "Enable optional ROS2 bag reading"     OFF)
 option(UNICALIB_WITH_PCL_VIZ    "Enable PCL visualizer"                ON)
 option(UNICALIB_WITH_OPENMP     "Enable OpenMP parallelism"            ON)
 option(UNICALIB_WITH_PYTHON_BRIDGE "Enable AI coarse calib (Python)"   ON)
+option(UNICALIB_BUILD_TESTS      "Build unit tests"                     OFF)
 # iKalibr B-spline engine: requires velodyne_msgs, full ROS2, ufomap, opengv.
 # Default ON; set OFF for quick lean builds (e.g. -DUNICALIB_WITH_IKALIBR=OFF).
 option(UNICALIB_WITH_IKALIBR    "Build iKalibr B-spline calibration engine" ON)
@@ -667,9 +668,11 @@ endif()
 # ===========================================================================
 # 测试 (可选)
 # ===========================================================================
-if(BUILD_TESTING)
-  enable_testing()
-  add_subdirectory(tests)
+if(UNICALIB_BUILD_TESTS)
+    find_package(GTest REQUIRED)
+    enable_testing()
+    include(GoogleTest)
+    add_subdirectory(tests)
 endif()
 
 # ===========================================================================

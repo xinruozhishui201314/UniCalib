@@ -225,8 +225,15 @@ std::optional<ExtrinsicSE3> LiDARCameraCalibrator::calibrate_edge_align(
         cv::meanStdDev(e1, m1, s1);
         cv::meanStdDev(e2, m2, s2);
         if (s1[0] < 1e-5 || s2[0] < 1e-5) continue;
-        double ncc = (e1 - m1[0]).dot(e2 - m2[0]) /
-                     (s1[0] * s2[0] * e1.total() + 1e-10);
+        
+        // 修复除零风险：检查分母
+        double denom = s1[0] * s2[0] * e1.total();
+        if (std::abs(denom) < 1e-10) {
+            // 方差接近零，NCC 无意义，跳过此帧
+            UNICALIB_DEBUG("[EdgeAlign] 方差过小，跳过帧: denom={:.2e}", denom);
+            continue;
+        }
+        double ncc = (e1 - m1[0]).dot(e2 - m2[0]) / denom;
         best_ncc = std::max(best_ncc, ncc);
     }
 

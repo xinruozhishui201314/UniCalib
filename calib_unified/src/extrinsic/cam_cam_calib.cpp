@@ -8,6 +8,7 @@
 
 #include "unicalib/extrinsic/cam_cam_calib.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/math_safety.h"  // 修复：添加数学安全工具库
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -95,11 +96,44 @@ bool CamCamCalibrator::recover_pose_from_E(
     cv::Mat inliers;
     cv::Mat E = cv::findEssentialMat(pts0_ud, pts1_ud,
         cv::Mat::eye(3,3,CV_64F), cv::RANSAC, 0.999, 0.001, inliers);
-    if (E.empty()) return false;
+    
+    // 修复 3.1: 检查本质矩阵是否有效
+    if (E.empty()) {
+        UNICALIB_ERROR("[RecoverPoseE] 本质矩阵为空");
+        return false;
+    }
+    
+    // 修复 3.2: 检查内点数量是否充足
+    if (inliers.rows < 8) {
+        UNICALIB_ERROR("[RecoverPoseE] 内点数不足: {} (需要≥8)", inliers.rows);
+        return false;
+    }
+    
+    // 修复 3.3: 检查内点占比是否合理
+    double inlier_ratio = static_cast<double>(inliers.rows) / matches.size();
+    if (inlier_ratio < 0.3) {  // 至少 30% 的匹配是内点
+        UNICALIB_WARN("[RecoverPoseE] 内点占比过低: {:.2f}", inlier_ratio);
+        // 不直接返回 false，但继续尝试恢复
+    }
 
     cv::Mat R_cv, t_cv;
     cv::recoverPose(E, pts0_ud, pts1_ud,
                     cv::Mat::eye(3,3,CV_64F), R_cv, t_cv, inliers);
+    
+    // 修复 3.4: 检查旋转矩阵的有效性
+    // 旋转矩阵应该满足: det(R) = 1, R^T * R = I
+    double det = cv::determinant(R_cv);
+    if (std::abs(det - 1.0) > 0.1) {
+        UNICALIB_WARN("[RecoverPoseE] 旋转矩阵行列式异常: det={:.3f}", det);
+    }
+    
+    // 检查旋转矩阵是否接近奇异
+    cv::Mat RTR = R_cv.t() * R_cv;
+    cv::Mat identity = cv::Mat::eye(3,3,CV_64F);
+    double ortho_error = cv::norm(RTR, identity, cv::NORM_L2);
+    if (ortho_error > 0.1) {
+        UNICALIB_WARN("[RecoverPoseE] 旋转矩阵不正交: error={:.3f}", ortho_error);
+    }
 
     Eigen::Matrix3d R_eig;
     Eigen::Vector3d t_eig;

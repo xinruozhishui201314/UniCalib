@@ -86,11 +86,21 @@ void compute_oadev(
         }
         if (count == 0) continue;
 
+        // 修复除零风险：tau 应该大于 0
+        if (tau <= 0.0) {
+            UNICALIB_WARN("[Allan] tau 非正: tau={}", tau);
+            continue;
+        }
+        
         double avar = sum / (2.0 * tau * tau * count);
         double adev = std::sqrt(std::max(0.0, avar));
 
         // 不确定度估计 (chi-squared 近似)
         double dof  = (N - 2*m) / m;
+        if (dof <= 0.0) {
+            UNICALIB_WARN("[Allan] 自由度非正: dof={}", dof);
+            continue;
+        }
         double err  = adev / std::sqrt(2.0 * std::max(1.0, dof));
 
         taus_out.push_back(tau);
@@ -113,8 +123,10 @@ double log_interp(const std::vector<double>& taus,
             double t  = std::log10(tau_target);
             double t0 = std::log10(taus[i]);
             double t1 = std::log10(taus[i+1]);
-            double a0 = std::log10(std::max(1e-20, adevs[i]));
-            double a1 = std::log10(std::max(1e-20, adevs[i+1]));
+            // 修复数值稳定性：使用更合理的阈值
+            constexpr double MIN_ADEV_THRESHOLD = 1e-12; // 最小有效方差阈值
+            double a0 = std::log10(std::max(MIN_ADEV_THRESHOLD, adevs[i]));
+            double a1 = std::log10(std::max(MIN_ADEV_THRESHOLD, adevs[i+1]));
             double alpha = (t - t0) / (t1 - t0 + 1e-20);
             return std::pow(10.0, a0 + alpha * (a1 - a0));
         }
