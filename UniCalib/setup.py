@@ -1,6 +1,34 @@
-from setuptools import setup, find_packages
+import sys
 import os
 from glob import glob
+
+# colcon 会传入 --editable 等 setuptools 不认识的选项，在 import setuptools 前过滤掉
+def _strip_colcon_args(argv):
+    single_arg = (
+        "--build-directory", "--build-base", "--install-base",
+        "--install-purelib", "--install-platlib", "--install-lib",
+        "--install-headers", "--install-scripts", "--install-data",
+        "--script-dir", "--exec-prefix", "--install-layout",
+    )
+    out = []
+    skip_next = False
+    for a in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("--editable", "-e") or a.startswith("--editable="):
+            continue
+        if any(a.startswith(opt + "=") for opt in single_arg):
+            continue
+        if a in single_arg:
+            skip_next = True
+            continue
+        out.append(a)
+    return out
+
+sys.argv = _strip_colcon_args(sys.argv)
+
+from setuptools import setup, find_packages
 
 package_name = 'unicalib'
 

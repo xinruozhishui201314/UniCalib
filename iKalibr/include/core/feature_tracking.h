@@ -66,9 +66,9 @@ public:
 
     static Ptr Create(const cv::Point2f& raw, const cv::Point2f& undistorted, double timestamp);
 
-    inline Eigen::Vector2f Raw() const;
+    Eigen::Vector2f Raw() const;
 
-    inline Eigen::Vector2f Undistorted() const;
+    Eigen::Vector2f Undistorted() const;
 };
 
 using FeatureMap = std::map<int, Feature::Ptr>;

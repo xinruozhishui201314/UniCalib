@@ -33,6 +33,12 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "sensor/radar.h"
+#include <fstream>
+#include <cereal/archives/json.hpp>
+#include <cereal/types/memory.hpp>
+#include <cereal/types/vector.hpp>
+#include <cereal/types/string.hpp>
+#include "cereal/types/eigen.hpp"
 #include "ctraj/utils/utils.hpp"
 
 namespace {

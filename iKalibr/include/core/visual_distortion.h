@@ -31,7 +31,9 @@
 #define VISUAL_DISTORTION_H
 
 #include "util/utils.h"
+#include "util/status.hpp"
 #include "opencv2/imgproc.hpp"
+#include "opencv2/calib3d.hpp"
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);

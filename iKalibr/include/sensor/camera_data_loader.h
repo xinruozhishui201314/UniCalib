@@ -39,7 +39,7 @@
 #include "sensor/sensor_model.h"
 #include "rosbag/message_instance.h"
 #include "util/enum_cast.hpp"
-#include "sensor_msgs/Image.h"
+#include <sensor_msgs/msg/image.hpp>
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);
@@ -66,8 +66,8 @@ public:
     virtual ~CameraDataLoader() = default;
 
 protected:
-    template <class MsgType>
-    void CheckMessage(typename MsgType::ConstPtr msg) {
+    template <class PtrType>
+    void CheckMessage(PtrType msg) {
         if (msg == nullptr) {
             throw std::runtime_error(
                 "Wrong sensor model: '" + std::string(EnumCast::enumToString(GetCameraModel())) +
@@ -75,7 +75,7 @@ protected:
         }
     }
 
-    static void RefineImgMsgWrongEncoding(const sensor_msgs::Image::Ptr &msg);
+    static void RefineImgMsgWrongEncoding(const sensor_msgs::msg::Image::SharedPtr& msg);
 };
 
 class SensorImageLoader : public CameraDataLoader {

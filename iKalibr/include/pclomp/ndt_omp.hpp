@@ -5,6 +5,7 @@
 #include "pcl/search/impl/search.hpp"
 #include "pclomp/voxel_grid_covariance_omp.hpp"
 #include "unsupported/Eigen/NonLinearOptimization"
+#include <omp.h>
 
 namespace pclomp {
 enum NeighborSearchMethod { KDTREE, DIRECT26, DIRECT7, DIRECT1 };
@@ -593,8 +594,8 @@ void pclomp::NormalDistributionsTransform<PointSource, PointTarget>::computeTran
 }
 
 #ifndef _OPENMP
-int omp_get_max_threads() { return 1; }
-int omp_get_thread_num() { return 0; }
+inline int omp_get_max_threads() { return 1; }
+inline int omp_get_thread_num() { return 0; }
 #endif
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -38,8 +38,7 @@
 #include "config/configor.h"
 #include "sensor/imu_intrinsic.hpp"
 #include "sensor/rgbd_intrinsic.hpp"
-#include "tiny-viewer/core/viewer.h"
-#include "tiny-viewer/core/multi_viewer.h"
+#include "viewer/viewer.h"
 #include "veta/camera/pinhole_brown.h"
 #include "veta/camera/pinhole_fisheye.h"
 #include "opencv2/core.hpp"
@@ -292,7 +291,7 @@ public:
     // print the parameters in the console
     void ShowParamStatus();
 
-    std::vector<std::size_t> VisualizationSensors(ns_viewer::Viewer &viewer) const;
+    std::vector<std::size_t> VisualizationSensors(Viewer &viewer) const;
 
     std::vector<std::size_t> VisualizationSensors(ns_viewer::MultiViewer &viewer,
                                                   const std::string &win) const;
@@ -315,7 +314,7 @@ public:
     }
 
 private:
-    [[nodiscard]] std::vector<ns_viewer::EntityPtr> EntitiesForVisualization() const;
+    [[nodiscard]] std::vector<ns_viewer::Entity::Ptr> EntitiesForVisualization() const;
 
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW

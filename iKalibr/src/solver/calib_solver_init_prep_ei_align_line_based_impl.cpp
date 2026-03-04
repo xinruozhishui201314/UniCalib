@@ -40,6 +40,9 @@
 #include "viewer/viewer.h"
 #include "util/status.hpp"
 #include "calib/estimator.h"
+#include "core/event_preprocessing.h"
+#include "factor/data_correspondence.h"
+#include "opencv2/highgui.hpp"
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);

@@ -38,11 +38,12 @@
 #include "sensor/lidar.h"
 #include "rosbag/message_instance.h"
 #include "util/enum_cast.hpp"
+#ifdef IKALIBR_USE_VELODYNE_MSGS
 #include "velodyne_msgs/VelodyneScan.h"
+#endif
 #include "sensor/sensor_model.h"
 #include <pcl/point_types.h>
-#include <ros/ros.h>
-#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
 
@@ -72,8 +73,8 @@ public:
     virtual ~LiDARDataLoader() = default;
 
 protected:
-    template <class MsgType>
-    void CheckMessage(typename MsgType::ConstPtr msg) {
+    template <class T>
+    void CheckMessage(const std::shared_ptr<T>& msg) {
         if (msg == nullptr) {
             throw std::runtime_error(
                 "Wrong sensor model: '" + std::string(EnumCast::enumToString(GetLiDARModel())) +
@@ -82,6 +83,7 @@ protected:
     }
 };
 
+#ifdef IKALIBR_USE_VELODYNE_MSGS
 class Velodyne16 : public LiDARDataLoader {
 public:
     using Ptr = std::shared_ptr<Velodyne16>;
@@ -164,6 +166,7 @@ private:
 
     double VLP16_TIME_BLOCK[1824][16]{};
 };
+#endif  // IKALIBR_USE_VELODYNE_MSGS
 
 class VelodynePoints : public LiDARDataLoader {
 public:

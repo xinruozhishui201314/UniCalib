@@ -33,6 +33,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "viewer/visual_colorized_cloud_map.h"
+#include "core/visual_distortion.h"
 #include "calib/calib_param_manager.h"
 #include "pcl/kdtree/kdtree_flann.h"
 #include "sensor/camera.h"

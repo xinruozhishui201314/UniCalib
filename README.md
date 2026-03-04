@@ -33,11 +33,13 @@ CALIB_DATA_DIR=/path/to/data ./build_and_run.sh
 ```
 
 **更多选项**：
-- `./build_and_run.sh --build-only` - 仅构建镜像和C++代码，不运行标定
+- `./build_and_run.sh --build-only` - 仅构建镜像、外部工具和C++代码，不运行标定
+- `./build_and_run.sh --build-external-only` - 仅编译外部依赖工具（DM-Calib, iKalibr等）
 - `./build_and_run.sh --run-only` - 仅运行标定（需已有构建）
 - `./build_and_run.sh --shell` - 进入容器交互式Shell
 
 **详细文档**：
+- [外部工具编译指南](BUILD_EXTERNAL_TOOLS.md) - 编译DM-Calib, iKalibr等外部工具
 - [快速开始](QUICK_START.md) - 三步快速配置和运行
 - [LiDAR-Camera和Camera-Camera外参指南](LIDAR_CAMERA_AND_CAMERA_CAMERA.md) - 外参标定详细指南
 - [外参标定完善总结](EXTRINSIC_CALIBRATION_SUMMARY.md) - 外参标定完善说明

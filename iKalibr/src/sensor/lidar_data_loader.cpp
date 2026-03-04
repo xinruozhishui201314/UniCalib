@@ -37,16 +37,24 @@
 //
 
 #include "sensor/lidar_data_loader.h"
-#include "ikalibr/LivoxCustomMsg.h"
-#include "sensor_msgs/PointCloud2.h"
+#include "ikalibr/msg/livox_custom_msg.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
 #include "spdlog/spdlog.h"
 #include "util/status.hpp"
+#ifdef IKALIBR_USE_VELODYNE_MSGS
 #include "velodyne_msgs/VelodynePacket.h"
 #include "velodyne_pointcloud/pointcloudXYZIRT.h"
 #include "velodyne_pointcloud/rawdata.h"
+#endif
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);
+inline double stampToSec(const builtin_interfaces::msg::Time& t) {
+  return static_cast<double>(t.sec) + static_cast<double>(t.nanosec) * 1e-9;
+}
+inline bool stampIsZero(const builtin_interfaces::msg::Time& t) {
+  return t.sec == 0 && t.nanosec == 0;
+}
 }
 
 namespace ns_ikalibr {
@@ -62,7 +70,11 @@ LiDARDataLoader::Ptr LiDARDataLoader::GetLoader(const std::string &lidarModelStr
     LiDARDataLoader::Ptr dataLoader;
     switch (lidarModel) {
         case LidarModelType::VLP_16_PACKET:
+#ifdef IKALIBR_USE_VELODYNE_MSGS
             dataLoader = Velodyne16::Create(lidarModel);
+#else
+            throw Status(Status::CRITICAL, "VLP_16_PACKET requires IKALIBR_USE_VELODYNE_MSGS");
+#endif
             break;
         case LidarModelType::VLP_POINTS:
             dataLoader = VelodynePoints::Create(lidarModel);
@@ -93,6 +105,7 @@ LidarModelType LiDARDataLoader::GetLiDARModel() const { return _lidarModel; }
 // ----------
 // Velodyne16
 // ----------
+#ifdef IKALIBR_USE_VELODYNE_MSGS
 Velodyne16::Velodyne16(LidarModelType lidarModel)
     : LiDARDataLoader(lidarModel) {
     SetParameters();
@@ -103,6 +116,7 @@ Velodyne16::Ptr Velodyne16::Create(LidarModelType lidarModel) {
 }
 
 LiDARFrame::Ptr Velodyne16::UnpackScan(const rosbag::MessageInstance &msgInstance) {
+#ifdef IKALIBR_USE_VELODYNE_MSGS
     if (_lidarModel == LidarModelType::VLP_16_PACKET) {
         velodyne_msgs::VelodyneScan::ConstPtr scanMsg =
             msgInstance.instantiate<velodyne_msgs::VelodyneScan>();
@@ -113,10 +127,15 @@ LiDARFrame::Ptr Velodyne16::UnpackScan(const rosbag::MessageInstance &msgInstanc
                      "'Velodyne16' data loader only supports the lidar type: 'VLP_16_SIMU' and "
                      "'VLP_16_PACKET'");
     }
+#else
+    (void)msgInstance;
+    throw Status(Status::CRITICAL, "Velodyne support not built; rebuild with -DIKALIBR_USE_VELODYNE_MSGS");
+#endif
 }
 
 LiDARFrame::Ptr Velodyne16::UnpackScan(
     const velodyne_msgs::VelodyneScan::ConstPtr &lidarMsg) const {
+#ifdef IKALIBR_USE_VELODYNE_MSGS
     if (lidarMsg->header.stamp.isZero()) {
         Status(Status::WARNING, "lidar scan with zero timestamp exists!!!");
     }
@@ -228,6 +247,11 @@ LiDARFrame::Ptr Velodyne16::UnpackScan(
 
     return output;
 }
+#else
+    (void)lidarMsg;
+    throw Status(Status::CRITICAL, "Velodyne support not built; rebuild with -DIKALIBR_USE_VELODYNE_MSGS");
+#endif
+}
 
 double Velodyne16::GetExactTime(int dsr, int firing) const { return VLP16_TIME_BLOCK[firing][dsr]; }
 
@@ -288,6 +312,7 @@ void Velodyne16::SetParameters() {
 bool Velodyne16::PointInRange(float range) const {
     return (range >= CONFIG.minRange && range <= CONFIG.maxRange);
 }
+#endif  // IKALIBR_USE_VELODYNE_MSGS
 
 // --------------
 // VelodynePoints
@@ -300,18 +325,19 @@ VelodynePoints::Ptr VelodynePoints::Create(LidarModelType lidarModel) {
 }
 
 LiDARFrame::Ptr VelodynePoints::UnpackScan(const rosbag::MessageInstance &msgInstance) {
-    sensor_msgs::PointCloud2::ConstPtr lidarMsg =
-        msgInstance.instantiate<sensor_msgs::PointCloud2>();
+    auto lidarMsg = msgInstance.instantiate<sensor_msgs::msg::PointCloud2>();
 
-    CheckMessage<sensor_msgs::PointCloud2>(lidarMsg);
+    CheckMessage(lidarMsg);
 
+    pcl::PCLPointCloud2 pcl_pc2;
+    pcl_conversions::toPCL(*lidarMsg, pcl_pc2);
     PosIRTPointCloud pcIn;
-    pcl::fromROSMsg(*lidarMsg, pcIn);
+    pcl::fromPCLPointCloud2(pcl_pc2, pcIn);
 
-    if (lidarMsg->header.stamp.isZero()) {
+    if (stampIsZero(lidarMsg->header.stamp)) {
         Status(Status::WARNING, "lidar scan with zero timestamp exists!!!");
     }
-    double timebase = lidarMsg->header.stamp.toSec();
+    double timebase = stampToSec(lidarMsg->header.stamp);
 
     IKalibrPointCloud::Ptr cloud(new IKalibrPointCloud());
     cloud->is_dense = false;
@@ -354,18 +380,19 @@ OusterLiDAR::Ptr OusterLiDAR::Create(LidarModelType lidarModel) {
 }
 
 LiDARFrame::Ptr OusterLiDAR::UnpackScan(const rosbag::MessageInstance &msgInstance) {
-    sensor_msgs::PointCloud2::ConstPtr lidarMsg =
-        msgInstance.instantiate<sensor_msgs::PointCloud2>();
+    auto lidarMsg = msgInstance.instantiate<sensor_msgs::msg::PointCloud2>();
 
-    CheckMessage<sensor_msgs::PointCloud2>(lidarMsg);
+    CheckMessage(lidarMsg);
 
+    pcl::PCLPointCloud2 pcl_pc2;
+    pcl_conversions::toPCL(*lidarMsg, pcl_pc2);
     OusterPointCloud pcIn;
-    pcl::fromROSMsg(*lidarMsg, pcIn);
+    pcl::fromPCLPointCloud2(pcl_pc2, pcIn);
 
-    if (lidarMsg->header.stamp.isZero()) {
+    if (stampIsZero(lidarMsg->header.stamp)) {
         Status(Status::WARNING, "lidar scan with zero timestamp exists!!!");
     }
-    double timebase = lidarMsg->header.stamp.toSec();
+    double timebase = stampToSec(lidarMsg->header.stamp);
 
     IKalibrPointCloud::Ptr cloud(new IKalibrPointCloud());
     cloud->is_dense = false;
@@ -408,18 +435,19 @@ OusterRing16LiDAR::Ptr OusterRing16LiDAR::Create(LidarModelType lidarModel) {
 }
 
 LiDARFrame::Ptr OusterRing16LiDAR::UnpackScan(const rosbag::MessageInstance &msgInstance) {
-    sensor_msgs::PointCloud2::ConstPtr lidarMsg =
-        msgInstance.instantiate<sensor_msgs::PointCloud2>();
+    auto lidarMsg = msgInstance.instantiate<sensor_msgs::msg::PointCloud2>();
 
-    CheckMessage<sensor_msgs::PointCloud2>(lidarMsg);
+    CheckMessage(lidarMsg);
 
+    pcl::PCLPointCloud2 pcl_pc2;
+    pcl_conversions::toPCL(*lidarMsg, pcl_pc2);
     OusterRing16PointCloud pcIn;
-    pcl::fromROSMsg(*lidarMsg, pcIn);
+    pcl::fromPCLPointCloud2(pcl_pc2, pcIn);
 
-    if (lidarMsg->header.stamp.isZero()) {
+    if (stampIsZero(lidarMsg->header.stamp)) {
         Status(Status::WARNING, "lidar scan with zero timestamp exists!!!");
     }
-    double timebase = lidarMsg->header.stamp.toSec();
+    double timebase = stampToSec(lidarMsg->header.stamp);
 
     IKalibrPointCloud::Ptr cloud(new IKalibrPointCloud());
     cloud->is_dense = false;
@@ -462,18 +490,19 @@ PandarXTLiDAR::Ptr PandarXTLiDAR::Create(LidarModelType lidarModel) {
 }
 
 LiDARFrame::Ptr PandarXTLiDAR::UnpackScan(const rosbag::MessageInstance &msgInstance) {
-    sensor_msgs::PointCloud2::ConstPtr lidarMsg =
-        msgInstance.instantiate<sensor_msgs::PointCloud2>();
+    auto lidarMsg = msgInstance.instantiate<sensor_msgs::msg::PointCloud2>();
 
-    CheckMessage<sensor_msgs::PointCloud2>(lidarMsg);
+    CheckMessage(lidarMsg);
 
+    pcl::PCLPointCloud2 pcl_pc2;
+    pcl_conversions::toPCL(*lidarMsg, pcl_pc2);
     PandarPointCloud pcIn;
-    pcl::fromROSMsg(*lidarMsg, pcIn);
+    pcl::fromPCLPointCloud2(pcl_pc2, pcIn);
 
-    if (lidarMsg->header.stamp.isZero()) {
+    if (stampIsZero(lidarMsg->header.stamp)) {
         Status(Status::WARNING, "lidar scan with zero timestamp exists!!!");
     }
-    double timebase = lidarMsg->header.stamp.toSec();
+    double timebase = stampToSec(lidarMsg->header.stamp);
 
     /// point cloud
     IKalibrPointCloud::Ptr cloud(new IKalibrPointCloud);
@@ -517,15 +546,15 @@ LivoxLiDAR::Ptr LivoxLiDAR::Create(LidarModelType lidarModel) {
 }
 
 LiDARFrame::Ptr LivoxLiDAR::UnpackScan(const rosbag::MessageInstance &msgInstance) {
-    ikalibr::LivoxCustomMsg::ConstPtr lidarMsg = msgInstance.instantiate<ikalibr::LivoxCustomMsg>();
+    auto lidarMsg = msgInstance.instantiate<ikalibr::msg::LivoxCustomMsg>();
 
-    CheckMessage<ikalibr::LivoxCustomMsg>(lidarMsg);
+    CheckMessage(lidarMsg);
 
-    if (lidarMsg->header.stamp.isZero()) {
+    if (stampIsZero(lidarMsg->header.stamp)) {
         Status(Status::WARNING, "lidar scan with zero timestamp exists!!!");
     }
     // from nanosecond to second
-    double timebase = lidarMsg->header.stamp.toSec();
+    double timebase = stampToSec(lidarMsg->header.stamp);
 
     IKalibrPointCloud::Ptr cloud(new IKalibrPointCloud);
     cloud->resize(lidarMsg->point_num);
@@ -567,17 +596,18 @@ RSLIDAR_POINTS::Ptr RSLIDAR_POINTS::Create(LidarModelType lidarModel) {
 }
 
 LiDARFrame::Ptr RSLIDAR_POINTS::UnpackScan(const rosbag::MessageInstance &msgInstance) {
-    sensor_msgs::PointCloud2::ConstPtr lidarMsg =
-        msgInstance.instantiate<sensor_msgs::PointCloud2>();
-    CheckMessage<sensor_msgs::PointCloud2>(lidarMsg);
+    auto lidarMsg = msgInstance.instantiate<sensor_msgs::msg::PointCloud2>();
+    CheckMessage(lidarMsg);
 
+    pcl::PCLPointCloud2 pcl_pc2;
+    pcl_conversions::toPCL(*lidarMsg, pcl_pc2);
     RsPointCloud pcIn;
-    pcl::fromROSMsg(*lidarMsg, pcIn);
+    pcl::fromPCLPointCloud2(pcl_pc2, pcIn);
 
-    if (lidarMsg->header.stamp.isZero()) {
+    if (stampIsZero(lidarMsg->header.stamp)) {
         SPDLOG_WARN("RSLIDAR_POINTS scan with zero timestamp.");
     }
-    double timebase = lidarMsg->header.stamp.toSec();
+    double timebase = stampToSec(lidarMsg->header.stamp);
 
     IKalibrPointCloud::Ptr cloud(new IKalibrPointCloud());
     cloud->is_dense = false;
@@ -585,7 +615,7 @@ LiDARFrame::Ptr RSLIDAR_POINTS::UnpackScan(const rosbag::MessageInstance &msgIns
 
     size_t validCount = 0;
     for (const auto &src : pcIn) {
-        if (!pcl::isFinite(src)) {
+        if (!std::isfinite(src.x) || !std::isfinite(src.y) || !std::isfinite(src.z)) {
             continue;
         }
 

@@ -44,7 +44,10 @@
 #include "ctraj/core/pose.hpp"
 #include "ctraj/core/spline_bundle.h"
 #include "optional"
-#include "pcl/point_cloud.h"
+#include <pcl/point_cloud.h>
+#include <boost/make_shared.hpp>
+#include <boost/shared_ptr.hpp>
+#include "util/cloud_define.hpp"
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);
@@ -63,7 +66,6 @@ using ColorPointCloudPtr = boost::shared_ptr<pcl::PointCloud<PointXYZRGBA>>;
 }  // namespace pcl
 
 struct PointXYZT;
-using IKalibrPointCloudPtr = boost::shared_ptr<pcl::PointCloud<PointXYZT>>;
 
 namespace ns_ikalibr {
 struct CalibParamManager;
@@ -346,7 +348,7 @@ protected:
      * @param topic ros topic for the RGBD
      * @return the global colorized map
      */
-    pcl::ColorPointCloudPtr BuildGlobalColorMapOfRGBD(const std::string &topic) const;
+    ColorPointCloud::Ptr BuildGlobalColorMapOfRGBD(const std::string &topic) const;
 
     /**
      * build the global map for RGBDs

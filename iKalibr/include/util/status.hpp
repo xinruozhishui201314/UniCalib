@@ -35,11 +35,17 @@
 #ifndef IKALIBR_STATUS_HPP
 #define IKALIBR_STATUS_HPP
 
-#include "exception"
-#include "string"
+#include <exception>
+#include <string>
 #include "util/enum_cast.hpp"
 #include "spdlog/fmt/fmt.h"
-#include "spdlog/fmt/bundled/color.h"
+#if __has_include("spdlog/fmt/bundled/color.h")
+#  include "spdlog/fmt/bundled/color.h"
+#elif __has_include("fmt/color.h")
+#  include "fmt/color.h"
+#else
+#  include "spdlog/fmt/color.h"
+#endif
 #include "spdlog/spdlog.h"
 
 namespace {

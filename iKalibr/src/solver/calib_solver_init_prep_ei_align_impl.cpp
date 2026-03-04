@@ -42,6 +42,10 @@
 #include "core/feature_tracking.h"
 #include "core/event_trace_sac.h"
 #include "calib/estimator.h"
+#include "factor/data_correspondence.h"
+#include "core/rotation_estimator.h"
+#include "core/optical_flow_trace.h"
+#include "opencv2/highgui.hpp"
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);

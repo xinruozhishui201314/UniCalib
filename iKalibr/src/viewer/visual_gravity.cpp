@@ -33,6 +33,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "viewer/visual_gravity.h"
+#include "core/visual_distortion.h"
 #include <utility>
 #include "calib/calib_param_manager.h"
 #include "opencv2/imgproc.hpp"

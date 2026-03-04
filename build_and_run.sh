@@ -4,10 +4,11 @@
 # 功能: Docker环境管理 → 编译C++主框架 → 执行标定流程
 #
 # 用法:
-#   ./build_and_run.sh                    # 完整流程：构建镜像 + 编译 + 运行
-#   ./build_and_run.sh --build-only       # 仅构建镜像和C++代码，不运行标定
-#   ./build_and_run.sh --run-only        # 仅运行标定（需已有构建）
-#   ./build_and_run.sh --shell           # 进入容器交互式Shell
+#   ./build_and_run.sh                        # 完整流程：构建镜像 + 编译外部工具 + C++ + 运行
+#   ./build_and_run.sh --build-only           # 仅构建镜像、外部工具和C++代码，不运行标定
+#   ./build_and_run.sh --build-external-only   # 仅编译外部依赖工具（DM-Calib, iKalibr等）
+#   ./build_and_run.sh --run-only            # 仅运行标定（需已有构建）
+#   ./build_and_run.sh --shell               # 进入容器交互式Shell
 #
 # 环境变量:
 #   CALIB_DATA_DIR       数据目录 (默认: /tmp/calib_data)
@@ -31,12 +32,14 @@ CALIB_RESULTS_DIR="${CALIB_RESULTS_DIR:-/tmp/calib_results}"
 MODE_BUILD_ONLY=false
 MODE_RUN_ONLY=false
 MODE_SHELL=false
+BUILD_EXTERNAL_ONLY=false
 
 # 解析参数
 for arg in "$@"; do
     [ "$arg" = "--build-only" ] && MODE_BUILD_ONLY=true
     [ "$arg" = "--run-only" ] && MODE_RUN_ONLY=true
     [ "$arg" = "--shell" ] && MODE_SHELL=true
+    [ "$arg" = "--build-external-only" ] && BUILD_EXTERNAL_ONLY=true
 done
 
 # 颜色输出
@@ -132,6 +135,62 @@ ensure_docker_image() {
     else
         print_error "Docker 镜像构建失败"
         exit 1
+    fi
+}
+
+# =============================================================================
+# 编译外部依赖工具（在容器内，依赖保存到项目目录）
+# =============================================================================
+
+build_external_tools() {
+    print_header "编译外部依赖工具"
+
+    EXTERNAL_BUILD_SCRIPT="${PROJECT_ROOT}/build_external_tools.sh"
+
+    if [ ! -f "${EXTERNAL_BUILD_SCRIPT}" ]; then
+        print_error "外部工具编译脚本不存在: ${EXTERNAL_BUILD_SCRIPT}"
+        return 1
+    fi
+
+    print_info "在 Docker 容器内编译外部工具"
+    print_info "依赖将安装到项目目录的 .venv/ 中，下次无需重新安装"
+
+    # 在容器内执行编译
+    docker run --rm \
+        --gpus all \
+        --ipc=host \
+        -v "${PROJECT_ROOT}:/root/calib_ws:rw" \
+        -v "${PROJECT_ROOT}/docker/deps:/root/thirdparty/deps:ro" \
+        -e CALIB_DATA_DIR="/root/calib_ws/data" \
+        -e CALIB_RESULTS_DIR="/root/calib_ws/results" \
+        -e THIRDPARTY_DEPS="/root/thirdparty/deps" \
+        "${DOCKER_IMAGE}" \
+        bash -c "
+            set -e
+            echo '[INFO] 开始编译外部工具...'
+            cd /root/calib_ws
+            bash build_external_tools.sh
+            echo '[INFO] 外部工具编译完成'
+            echo '[INFO] 虚拟环境已保存到各工具目录的 .venv/'
+            echo '[INFO] 下次运行将直接使用，无需重新安装'
+        "
+
+    if [ $? -eq 0 ]; then
+        print_info "外部工具编译完成"
+        print_info "依赖已保存在各工具目录的 .venv/ 中"
+        # 自动化验证：iKalibr 第三方库（含 ctraj）必须构建成功
+        if [ -d "${PROJECT_ROOT}/iKalibr" ]; then
+            CTRAJ_INSTALL="${PROJECT_ROOT}/iKalibr/thirdparty-install/ctraj-install"
+            if [ -d "${CTRAJ_INSTALL}" ] && [ -f "${CTRAJ_INSTALL}/lib/libctraj.so" ] 2>/dev/null; then
+                print_info "验证通过: iKalibr 第三方库 (ctraj) 已正确安装"
+            elif [ -d "${CTRAJ_INSTALL}" ]; then
+                print_warn "iKalibr 第三方目录存在，但未检测到 libctraj.so（可能未编译 iKalibr）"
+            fi
+        fi
+        return 0
+    else
+        print_error "外部工具编译失败"
+        return 1
     fi
 }
 
@@ -326,7 +385,12 @@ main() {
     echo ""
     
     # 根据模式执行
-    if [ "$MODE_RUN_ONLY" = true ]; then
+    if [ "$BUILD_EXTERNAL_ONLY" = true ]; then
+        # 仅编译外部工具模式（均在容器内执行）
+        check_dependencies
+        ensure_docker_image
+        build_external_tools
+    elif [ "$MODE_RUN_ONLY" = true ]; then
         # 仅运行模式
         check_dependencies
         ensure_docker_image
@@ -340,12 +404,14 @@ main() {
         # 仅构建模式
         check_dependencies
         ensure_docker_image
+        build_external_tools
         build_cpp_project
         print_info "构建完成，使用 --run-only 运行标定流程"
     else
         # 完整流程
         check_dependencies
         ensure_docker_image
+        build_external_tools
         build_cpp_project
         run_calibration
     fi

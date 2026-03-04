@@ -40,11 +40,8 @@
 #include "opencv2/imgproc/imgproc.hpp"
 #include "spdlog/spdlog.h"
 #include "sensor/lidar_data_loader.h"
-#include "tiny-viewer/object/radar.h"
-#include "tiny-viewer/object/lidar.h"
-#include "tiny-viewer/object/imu.h"
-#include "tiny-viewer/object/camera.h"
-#include "tiny-viewer/core/pose.hpp"
+#include "viewer/viewer_types.h"
+#include "veta/cereal_registration.h"
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);
@@ -426,7 +423,7 @@ void CalibParamManager::ShowParamStatus() {
 #undef PARAM
 }
 
-std::vector<std::size_t> CalibParamManager::VisualizationSensors(ns_viewer::Viewer &viewer) const {
+std::vector<std::size_t> CalibParamManager::VisualizationSensors(Viewer &viewer) const {
     return viewer.AddEntity(EntitiesForVisualization());
 }
 

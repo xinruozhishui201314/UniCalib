@@ -33,6 +33,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "viewer/visual_lin_vel_drawer.h"
+#include "core/visual_distortion.h"
 #include "calib/calib_param_manager.h"
 #include "opencv2/imgproc.hpp"
 #include "sensor/rgbd.h"

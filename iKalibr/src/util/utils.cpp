@@ -33,6 +33,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "util/utils.h"
+#include <fstream>
 #include "filesystem"
 #include "ctraj/core/pose.hpp"
 #include "spdlog/spdlog.h"

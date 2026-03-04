@@ -38,6 +38,7 @@
 #include "veta/camera/pinhole.h"
 #include "opencv2/core.hpp"
 #include "util/cloud_define.hpp"
+#include <boost/shared_ptr.hpp>
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);
@@ -55,6 +56,11 @@ public:
     explicit VisualLiDARCovisibility(IKalibrPointCloud::Ptr cloudMap);
 
     static Ptr Create(const IKalibrPointCloud::Ptr &cloudMap);
+    // 兼容 boost::shared_ptr (IKalibrPointCloudPtr)
+    static Ptr Create(const boost::shared_ptr<pcl::PointCloud<PointXYZT>> &cloudMap) {
+        IKalibrPointCloud::Ptr stdCloud(cloudMap.get(), [](auto*){ /* no-op, shared ownership */ });
+        return Create(stdCloud);
+    }
 
     std::pair<cv::Mat, cv::Mat> CreateCovisibility(const Sophus::SE3d &SE3_CurCmToW,
                                                    const ns_veta::PinholeIntrinsic::Ptr &intri,

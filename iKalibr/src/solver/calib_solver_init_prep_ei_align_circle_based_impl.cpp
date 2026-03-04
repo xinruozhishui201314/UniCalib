@@ -40,6 +40,7 @@
 #include "viewer/viewer.h"
 #include "util/status.hpp"
 #include "core/ev_circle_tracking.h"
+#include "opencv2/highgui.hpp"
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);

@@ -41,6 +41,11 @@
 #include "veta/camera/pinhole.h"
 #include "opencv2/core.hpp"
 #include "util/cloud_define.hpp"
+#include <boost/shared_ptr.hpp>
+
+#ifndef ExpandPCLPointXYZ
+#define ExpandPCLPointXYZ(p) (p).x, (p).y, (p).z
+#endif
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);
@@ -97,6 +102,20 @@ public:
                               const CalibParamManagerPtr &parMagr);
 
     ColorPointCloud::Ptr Colorize(const IKalibrPointCloud::Ptr &cloudMap, int K = 5);
+
+    // 兼容 boost::shared_ptr (IKalibrPointCloudPtr) 的静态辅助方法
+    static ColorPointCloud::Ptr ColorizeFromBoostPtr(
+        const boost::shared_ptr<pcl::PointCloud<PointXYZT>> &boostCloudMap,
+        const std::vector<CameraFramePtr> &frames,
+        ns_veta::Veta::Ptr veta,
+        SplineBundleType::Ptr splines,
+        ns_veta::PinholeIntrinsic::Ptr intri,
+        const Sophus::SE3d &SE3_SenToBr,
+        const double &TO_SenToBr, int K = 5) {
+        IKalibrPointCloud::Ptr cloudMap(boostCloudMap.get(), [](auto*){ /* no-op */ });
+        ColorizedCloudMap shader(frames, veta, splines, intri, SE3_SenToBr, TO_SenToBr);
+        return shader.Colorize(cloudMap, K);
+    }
 
 protected:
     std::optional<Sophus::SE3d> CurCmToW(double timeByCm);

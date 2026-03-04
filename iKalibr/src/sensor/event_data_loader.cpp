@@ -33,11 +33,18 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "sensor/event_data_loader.h"
-#include "ikalibr/PropheseeEventArray.h"
-#include "ikalibr/DVSEventArray.h"
+#include "util/status.hpp"
+#include "ikalibr/msg/prophesee_event_array.hpp"
+#include "ikalibr/msg/dvs_event_array.hpp"
 
 namespace {
 bool IKALIBR_UNIQUE_NAME(_2_) = ns_ikalibr::_1_(__FILE__);
+inline double stampToSec(const builtin_interfaces::msg::Time& t) {
+  return static_cast<double>(t.sec) + static_cast<double>(t.nanosec) * 1e-9;
+}
+inline bool stampIsZero(const builtin_interfaces::msg::Time& t) {
+  return t.sec == 0 && t.nanosec == 0;
+}
 }
 
 namespace ns_ikalibr {
@@ -76,22 +83,22 @@ PropheseeEventDataLoader::Ptr PropheseeEventDataLoader::Create(EventModelType mo
 }
 
 EventArray::Ptr PropheseeEventDataLoader::UnpackData(const rosbag::MessageInstance& msgInstance) {
-    ikalibr::PropheseeEventArrayPtr msg = msgInstance.instantiate<ikalibr::PropheseeEventArray>();
+    auto msg = msgInstance.instantiate<ikalibr::msg::PropheseeEventArray>();
 
-    CheckMessage<ikalibr::PropheseeEventArray>(msg);
+    CheckMessage<ikalibr::msg::PropheseeEventArray>(msg);
 
     std::vector<Event::Ptr> events(msg->events.size());
 
-    for (int i = 0; i < static_cast<int>(msg->events.size()); i++) {
+    for (size_t i = 0; i < msg->events.size(); i++) {
         const auto& event = msg->events.at(i);
         events.at(i) =
-            Event::Create(event.ts.toSec(), Event::PosType(event.x, event.y), event.polarity);
+            Event::Create(stampToSec(event.ts), Event::PosType(static_cast<float>(event.x), static_cast<float>(event.y)), event.polarity);
     }
 
-    if (msg->header.stamp.isZero()) {
+    if (stampIsZero(msg->header.stamp)) {
         return EventArray::Create(events.back()->GetTimestamp(), events);
     } else {
-        return EventArray::Create(msg->header.stamp.toSec(), events);
+        return EventArray::Create(stampToSec(msg->header.stamp), events);
     }
 }
 
@@ -103,21 +110,21 @@ DVSEventDataLoader::Ptr DVSEventDataLoader::Create(EventModelType model) {
 }
 
 EventArray::Ptr DVSEventDataLoader::UnpackData(const rosbag::MessageInstance& msgInstance) {
-    ikalibr::DVSEventArrayPtr msg = msgInstance.instantiate<ikalibr::DVSEventArray>();
+    auto msg = msgInstance.instantiate<ikalibr::msg::DVSEventArray>();
 
-    CheckMessage<ikalibr::DVSEventArray>(msg);
+    CheckMessage<ikalibr::msg::DVSEventArray>(msg);
 
     std::vector<Event::Ptr> events(msg->events.size());
 
-    for (int i = 0; i < static_cast<int>(msg->events.size()); i++) {
+    for (size_t i = 0; i < msg->events.size(); i++) {
         const auto& event = msg->events.at(i);
         events.at(i) =
-            Event::Create(event.ts.toSec(), Event::PosType(event.x, event.y), event.polarity);
+            Event::Create(stampToSec(event.ts), Event::PosType(static_cast<float>(event.x), static_cast<float>(event.y)), event.polarity);
     }
-    if (msg->header.stamp.isZero()) {
+    if (stampIsZero(msg->header.stamp)) {
         return EventArray::Create(events.back()->GetTimestamp(), events);
     } else {
-        return EventArray::Create(msg->header.stamp.toSec(), events);
+        return EventArray::Create(stampToSec(msg->header.stamp), events);
     }
 }
 }  // namespace ns_ikalibr
