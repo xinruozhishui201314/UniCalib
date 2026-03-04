@@ -460,6 +460,13 @@ set(UNICALIB_NEW_SOURCES
     src/io/yaml_io.cpp
 )
 
+# 最小 iKalibr 依赖：供 IMU-LiDAR 外参标定使用 (LiDAROdometer / LiDARFrame / _1_)
+set(IKALIBR_MINIMAL_FOR_IMU_LIDAR
+    src/ikalibr/util/utils.cpp
+    src/ikalibr/sensor/lidar.cpp
+    src/ikalibr/core/lidar_odometer.cpp
+)
+
 # iKalibr sources are optional (requires full ROS2 + velodyne_msgs + ufomap + opengv)
 if(UNICALIB_WITH_IKALIBR)
     add_compile_definitions(UNICALIB_WITH_IKALIBR=1)
@@ -475,8 +482,10 @@ if(UNICALIB_WITH_IKALIBR)
 else()
     message(STATUS "iKalibr: disabled (lean build — use -DUNICALIB_WITH_IKALIBR=ON to enable B-spline engine)")
     add_compile_definitions(UNICALIB_WITH_IKALIBR=0)
+    # 仍链接 IMU-LiDAR 所需的最小 iKalibr 实现，避免 undefined reference
     add_library(unicalib SHARED
         ${UNICALIB_NEW_SOURCES}
+        ${IKALIBR_MINIMAL_FOR_IMU_LIDAR}
     )
 endif()
 

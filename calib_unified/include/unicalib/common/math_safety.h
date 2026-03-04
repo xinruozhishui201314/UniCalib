@@ -162,19 +162,20 @@ inline T safeDivideWithFallback(const T& numerator, const T& denominator,
 
 /**
  * @brief 安全的向量归一化：检查是否接近零
- * @return 归一化后的向量，或原向量（如果接近零）
+ * @return 归一化后的向量，如果接近零则返回零向量
  */
 template<typename Derived>
 inline auto safeNormalize(const Eigen::MatrixBase<Derived>& vec,
                            double eps = EPS_NORM)
-    -> decltype((vec.derived() / vec.norm()).eval()) {
+    -> typename Derived::PlainObject {
     
+    using Scalar = typename Derived::Scalar;
     double norm = vec.norm();
     if (norm < eps) {
-        // 向量接近零，返回零向量或单位向量
-        return vec.derived() * T(0);
+        // 向量接近零，返回零向量
+        return Derived::PlainObject::Zero(vec.size());
     }
-    return vec.derived() / norm;
+    return vec.derived() / static_cast<Scalar>(norm);
 }
 
 /**
@@ -196,19 +197,20 @@ inline Eigen::Quaterniond safeNormalize(const Eigen::Quaterniond& q,
  * @return 归一化后的向量和状态（是否成功）
  */
 template<typename Derived>
-inline Eigen::MatrixBase<Derived> safeNormalizeWithStatus(
+inline typename Derived::PlainObject safeNormalizeWithStatus(
     const Eigen::MatrixBase<Derived>& vec,
     bool& success,
     double eps = EPS_NORM) {
     
+    using Scalar = typename Derived::Scalar;
     double norm = vec.norm();
     success = (norm >= eps);
     
     if (success) {
-        return vec.derived() / norm;
+        return vec.derived() / static_cast<Scalar>(norm);
     } else {
-        // 向量接近零，返回原向量或零向量
-        return vec.derived() * T(0);
+        // 向量接近零，返回零向量
+        return Derived::PlainObject::Zero(vec.size());
     }
 }
 

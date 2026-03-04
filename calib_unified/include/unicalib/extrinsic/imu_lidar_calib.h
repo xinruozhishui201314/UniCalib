@@ -76,6 +76,17 @@ public:
         double static_gyro_thresh = 0.05;    // rad/s — 静态判断
         double min_motion_rot_deg = 3.0;     // 最小运动量 [deg]
 
+        // 可观测性检测参数 (处理平面运动)
+        double min_axis_diversity = 0.3;     // 旋转轴多样性阈值 [0.0=差, 1.0=好]
+        double min_pitch_motion_deg = 5.0;   // pitch 方向最小运动 [deg]
+        double min_roll_motion_deg = 5.0;    // roll 方向最小运动 [deg]
+        double min_yaw_motion_deg = 5.0;     // yaw 方向最小运动 [deg]
+        double max_z_trans_ratio = 0.2;     // z 平移占比上限 (超过此值认为非平面运动)
+
+        bool   enable_planar_warning = true; // 是否启用平面运动警告
+
+        bool   use_planar_prior = true;     // 平面运动先验 (约束 z 方向)
+
         // B样条优化
         double spline_dt_s  = 0.1;          // 样条结时间间隔 [s]
         int    spline_order = 4;            // B样条阶数 (4=cubic)
@@ -90,8 +101,21 @@ public:
         bool   verbose = true;
     };
 
+    // 可观测性诊断结果
+    struct ObservabilityDiagnosis {
+        double axis_diversity = 0.0;      // 旋转轴多样性 [0,1]
+        double pitch_motion_deg = 0.0;    // pitch 方向总运动 [deg]
+        double roll_motion_deg = 0.0;     // roll 方向总运动 [deg]
+        double yaw_motion_deg = 0.0;      // yaw 方向总运动 [deg]
+        double z_trans_ratio = 0.0;       // z 平移占比
+        bool   is_planar_motion = false;  // 是否为平面运动
+        std::string recommendation;       // 建议
+        std::vector<std::string> warnings; // 警告列表
+    };
+
     explicit IMULiDARCalibrator(const Config& cfg) : cfg_(cfg) {}
     IMULiDARCalibrator() : cfg_(Config{}) {}
+    ~IMULiDARCalibrator() = default;  // public 析构，供 JointCalibSolver 等栈上析构
 
     // ===================================================================
     // 两阶段标定接口 (推荐使用)
@@ -203,6 +227,12 @@ private:
         const std::string& imu_id,
         const std::string& lidar_id,
         const IMUIntrinsics* imu_intrin);
+
+    // Step 辅助: IMU 旋转积分
+    Sophus::SO3d integrate_imu_rotation(
+        const std::vector<IMUFrame>& imu_data,
+        double t_begin,
+        double t_end);
 };
 
 }  // namespace ns_unicalib

@@ -353,19 +353,64 @@ ExtrinsicSE3 CamCamCalibrator::bundle_adjustment_two_views(
 
     ceres::Problem problem;
     int n_valid = 0;
+    int n_invalid_depth = 0;
+    int n_invalid_proj = 0;
+    
     for (int i = 0; i < pts4d.cols; ++i) {
         float w = pts4d.at<float>(3,i);
-        if (std::abs(w) < 1e-6) continue;
+        if (std::abs(w) < 1e-6) {
+            ++n_invalid_depth;
+            continue;
+        }
         float x = pts4d.at<float>(0,i)/w;
         float y = pts4d.at<float>(1,i)/w;
         float z = pts4d.at<float>(2,i)/w;
-        if (z < 0.1 || z > 200.0) continue;
+        
+        // 深度范围检查
+        if (z < 0.1 || z > 200.0) {
+            ++n_invalid_depth;
+            continue;
+        }
+        
+        // 检查 3D 点是否在相机前方 (视锥体约束)
+        // 假设相机朝向 +Z 方向，需要 z > 0
+        if (z <= 0) {
+            ++n_invalid_depth;
+            continue;
+        }
+        
+        // 检查重投影是否在图像范围内
+        double proj_u = intrin1.fx * x / z + intrin1.cx;
+        double proj_v = intrin1.fy * y / z + intrin1.cy;
+        
+        // 允许一定边界外 (5% 边距)
+        double margin = std::max(10.0, 0.05 * std::min(intrin1.width, intrin1.height));
+        if (proj_u < -margin || proj_u > intrin1.width + margin) {
+            ++n_invalid_proj;
+            continue;
+        }
+        if (proj_v < -margin || proj_v > intrin1.height + margin) {
+            ++n_invalid_proj;
+            continue;
+        }
+        
+        // 检查 x, y 合理性 (避免过大的横向偏移)
+        if (std::abs(x) > 100.0 || std::abs(y) > 100.0) {
+            ++n_invalid_proj;
+            continue;
+        }
+        
         problem.AddResidualBlock(
             ReprojectCost::Create(raw1[i].x, raw1[i].y,
                                   intrin1.fx, intrin1.fy, intrin1.cx, intrin1.cy,
                                   x, y, z),
             new ceres::HuberLoss(1.0), pose);
         ++n_valid;
+    }
+    
+    if (n_valid > 0) {
+        UNICALIB_DEBUG("  BA: 有效点={}, 无效深度={}, 无效投影={}", 
+                      n_valid, n_invalid_depth, n_invalid_proj);
     }
 
     if (n_valid >= 10) {
