@@ -92,9 +92,14 @@ bool Ros2BagDataSource::read_metadata_yaml(const std::string& bag_file) {
 void Ros2BagDataSource::auto_detect_topics(
     const std::map<std::string, size_t>& topic_msg_counts) {
     
-    // 如果用户已手动配置话题，跳过自动检测
-    if (!cfg_.lidar_topics.empty() && !cfg_.lidar_ros2_topic.empty()) {
-        // LiDAR 话题智能匹配
+    // 1) 优先使用配置中的单话题（来自配置文件 sensors[].topic 或 ros2.lidar_topic 等）
+    if (!cfg_.lidar_ros2_topic.empty()) {
+        topic_mapping_.lidar_topic = cfg_.lidar_ros2_topic;
+        UNICALIB_INFO("[Ros2BagDataSource] 使用配置的 LiDAR 话题: {}", cfg_.lidar_ros2_topic);
+    } else if (!cfg_.lidar_topics.empty()) {
+        topic_mapping_.lidar_topic = cfg_.lidar_topics.begin()->second;
+        UNICALIB_INFO("[Ros2BagDataSource] 使用配置的 LiDAR 话题 (来自 sensors): {}", topic_mapping_.lidar_topic);
+    } else {
         std::string detected_lidar = find_best_lidar_topic(topic_msg_counts);
         if (!detected_lidar.empty()) {
             topic_mapping_.lidar_topic = detected_lidar;
@@ -102,8 +107,13 @@ void Ros2BagDataSource::auto_detect_topics(
         }
     }
     
-    if (!cfg_.camera_topics.empty() && !cfg_.camera_ros2_topic.empty()) {
-        // 相机话题智能匹配
+    if (!cfg_.camera_ros2_topic.empty()) {
+        topic_mapping_.camera_topic = cfg_.camera_ros2_topic;
+        UNICALIB_INFO("[Ros2BagDataSource] 使用配置的相机话题: {}", cfg_.camera_ros2_topic);
+    } else if (!cfg_.camera_topics.empty()) {
+        topic_mapping_.camera_topic = cfg_.camera_topics.begin()->second;
+        UNICALIB_INFO("[Ros2BagDataSource] 使用配置的相机话题 (来自 sensors): {}", topic_mapping_.camera_topic);
+    } else {
         std::string detected_camera = find_best_camera_topic(topic_msg_counts);
         if (!detected_camera.empty()) {
             topic_mapping_.camera_topic = detected_camera;
@@ -111,29 +121,18 @@ void Ros2BagDataSource::auto_detect_topics(
         }
     }
     
-    if (!cfg_.imu_topics.empty() && !cfg_.imu_ros2_topic.empty()) {
-        // IMU 话题智能匹配
+    if (!cfg_.imu_ros2_topic.empty()) {
+        topic_mapping_.imu_topic = cfg_.imu_ros2_topic;
+        UNICALIB_INFO("[Ros2BagDataSource] 使用配置的 IMU 话题: {}", cfg_.imu_ros2_topic);
+    } else if (!cfg_.imu_topics.empty()) {
+        topic_mapping_.imu_topic = cfg_.imu_topics.begin()->second;
+        UNICALIB_INFO("[Ros2BagDataSource] 使用配置的 IMU 话题 (来自 sensors): {}", topic_mapping_.imu_topic);
+    } else {
         std::string detected_imu = find_best_imu_topic(topic_msg_counts);
         if (!detected_imu.empty()) {
             topic_mapping_.imu_topic = detected_imu;
             UNICALIB_INFO("[Ros2BagDataSource] 自动检测 IMU 话题: {}", detected_imu);
         }
-    }
-    
-    // 用户手动配置的话题优先于自动检测
-    if (!cfg_.lidar_ros2_topic.empty()) {
-        topic_mapping_.lidar_topic = cfg_.lidar_ros2_topic;
-        UNICALIB_INFO("[Ros2BagDataSource] 使用用户配置的 LiDAR 话题: {}", cfg_.lidar_ros2_topic);
-    }
-    
-    if (!cfg_.camera_ros2_topic.empty()) {
-        topic_mapping_.camera_topic = cfg_.camera_ros2_topic;
-        UNICALIB_INFO("[Ros2BagDataSource] 使用用户配置的相机话题: {}", cfg_.camera_ros2_topic);
-    }
-    
-    if (!cfg_.imu_ros2_topic.empty()) {
-        topic_mapping_.imu_topic = cfg_.imu_ros2_topic;
-        UNICALIB_INFO("[Ros2BagDataSource] 使用用户配置的 IMU 话题: {}", cfg_.imu_ros2_topic);
     }
 }
 

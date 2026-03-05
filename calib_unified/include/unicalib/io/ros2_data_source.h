@@ -91,10 +91,15 @@ struct RosDataSourceConfig {
     // bag 文件路径
     std::string bag_file;
     
-    // 话题映射: sensor_id -> topic name
+    // 话题映射: sensor_id -> topic name（多传感器时使用）
     std::map<std::string, std::string> lidar_topics;
     std::map<std::string, std::string> camera_topics;
     std::map<std::string, std::string> imu_topics;
+    
+    // 单话题覆盖（可选；未设置时从 lidar_topics/camera_topics/imu_topics 取，或由 sensors 配置默认）
+    std::string lidar_ros2_topic;
+    std::string camera_ros2_topic;
+    std::string imu_ros2_topic;
     
     // 时间窗口 (秒, 0 = 全部数据)
     double time_window_start = 0.0;

@@ -605,12 +605,18 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
         ros_cfg.sample_interval = cfg_.ros2_sample_interval;
         ros_cfg.max_frames = cfg_.ros2_max_frames;
         
-        // 设置话题映射
+        // 设置话题映射（单话题与 map 一致，便于数据源使用）
         if (!cfg_.lidar_ros2_topic.empty()) {
             ros_cfg.lidar_topics[cfg_.lidar_id] = cfg_.lidar_ros2_topic;
+            ros_cfg.lidar_ros2_topic = cfg_.lidar_ros2_topic;
         }
         if (!cfg_.camera_ros2_topic.empty()) {
             ros_cfg.camera_topics[cfg_.camera_id] = cfg_.camera_ros2_topic;
+            ros_cfg.camera_ros2_topic = cfg_.camera_ros2_topic;
+        }
+        if (!cfg_.imu_ros2_topic.empty()) {
+            ros_cfg.imu_topics["imu_0"] = cfg_.imu_ros2_topic;
+            ros_cfg.imu_ros2_topic = cfg_.imu_ros2_topic;
         }
         
         // 创建 ROS2 数据源

@@ -31,6 +31,7 @@
 #include "unicalib/intrinsic/imu_intrinsic_calib.h"
 #include "unicalib/intrinsic/camera_calib.h"
 #include "unicalib/io/yaml_io.h"
+#include "unicalib/common/sensor_types.h"
 #include <yaml-cpp/yaml.h>
 #include <filesystem>
 #include <iostream>
@@ -338,6 +339,38 @@ int main(int argc, char** argv) {
         pipe_cfg.cam_cam_rms_threshold   = cfg["cam_cam_rms_threshold"].as<double>();
     if (cfg["imu_lidar_rot_threshold"])
         pipe_cfg.imu_lidar_rot_threshold = cfg["imu_lidar_rot_threshold"].as<double>();
+
+    // ─── ROS2 / 传感器话题：默认从配置文件 sensors 与 ros2 段读取 ───
+    const YAML::Node ros2_node = cfg["ros2"];
+    if (ros2_node) {
+        if (ros2_node["use_ros2_bag"])   pipe_cfg.use_ros2_bag   = ros2_node["use_ros2_bag"].as<bool>();
+        if (ros2_node["use_ros2_topics"]) pipe_cfg.use_ros2_topics = ros2_node["use_ros2_topics"].as<bool>();
+        if (ros2_node["ros2_bag_file"])   pipe_cfg.ros2_bag_file = ros2_node["ros2_bag_file"].as<std::string>();
+        if (ros2_node["max_wait_time"])  pipe_cfg.ros2_max_wait_time = ros2_node["max_wait_time"].as<double>();
+        if (ros2_node["sample_interval"]) pipe_cfg.ros2_sample_interval = ros2_node["sample_interval"].as<double>();
+        if (ros2_node["max_frames"])     pipe_cfg.ros2_max_frames = ros2_node["max_frames"].as<size_t>();
+        if (ros2_node["lidar_topic"])    pipe_cfg.lidar_ros2_topic  = ros2_node["lidar_topic"].as<std::string>();
+        if (ros2_node["camera_topic"])   pipe_cfg.camera_ros2_topic = ros2_node["camera_topic"].as<std::string>();
+        if (ros2_node["imu_topic"])      pipe_cfg.imu_ros2_topic    = ros2_node["imu_topic"].as<std::string>();
+    }
+    // 话题未在 ros2 段指定时，默认从 sensors[].topic 按类型取第一个
+    for (const auto& s : sys_cfg.sensors) {
+        if (s.type == SensorType::LiDAR && pipe_cfg.lidar_ros2_topic.empty() && !s.topic.empty()) {
+            pipe_cfg.lidar_ros2_topic = s.topic;
+            pipe_cfg.lidar_id = s.sensor_id;
+        }
+        if (s.type == SensorType::CAMERA && pipe_cfg.camera_ros2_topic.empty() && !s.topic.empty()) {
+            pipe_cfg.camera_ros2_topic = s.topic;
+            pipe_cfg.camera_id = s.sensor_id;
+        }
+        if (s.type == SensorType::IMU && pipe_cfg.imu_ros2_topic.empty() && !s.topic.empty()) {
+            pipe_cfg.imu_ros2_topic = s.topic;
+        }
+    }
+    for (const auto& s : sys_cfg.sensors) {
+        if (s.type == SensorType::LiDAR && pipe_cfg.lidar_id == "lidar_front") pipe_cfg.lidar_id = s.sensor_id;
+        if (s.type == SensorType::CAMERA && pipe_cfg.camera_id == "cam_left")  pipe_cfg.camera_id = s.sensor_id;
+    }
 
     CalibPipeline pipeline(pipe_cfg);
 

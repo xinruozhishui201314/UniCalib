@@ -38,13 +38,13 @@ output_dir: ./calib_output/joint
 
 # ---------------------------------------------------------------------------
 # 传感器系统配置
-# 定义参与标定的传感器 id、类型、ROS topic 及各自参数，供联合标定与单任务读取
+# 定义参与标定的传感器 id、类型、ROS topic 及各自参数；IMU/LiDAR/Camera 话题默认由此读取，ros2 段可覆盖
 # ---------------------------------------------------------------------------
 sensors:
   # IMU：用于内参标定及作为外参参考系 (reference_imu)
   - id: imu_0
     type: imu
-    topic: /imu/data             # 使用 bag 时的 ROS topic
+    topic: /imu/data             # 默认 ROS/ROS2 话题（bag 与实时订阅均用）
     imu:
       rate_hz: 200.0
       model: scale_misalignment  # bias_only | scale_only | scale_misalignment
@@ -105,7 +105,8 @@ data:
       # intrinsic_yaml: /path/to/cam_left_intrinsic.yaml  # 有内参时可跳过内参标定
 
 # ---------------------------------------------------------------------------
-# ROS2 数据源配置 (新增)
+# ROS2 数据源配置
+# 话题默认从上方 sensors[].topic 按类型读取；此处可覆盖。
 # ---------------------------------------------------------------------------
 ros2:
   # 启用 ROS2 bag 文件读取 (优先于文件模式)
@@ -115,7 +116,7 @@ ros2:
   # 启用 ROS2 实时话题订阅 (用于在线标定)
   use_ros2_topics: false
   
-  # ROS2 话题名称 (对应 sensors[].topic)
+  # ROS2 话题名称（可选；不填则使用 sensors 中同类型第一个 sensor 的 topic）
   lidar_topic: /velodyne_points      # LiDAR 点云话题
   camera_topic: /cam_left/image_raw  # 相机图像话题
   imu_topic: /imu/data               # IMU 数据话题

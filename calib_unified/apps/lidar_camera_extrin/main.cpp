@@ -302,7 +302,7 @@ int main(int argc, char** argv) {
     pipe_cfg.log_level               = log_level;
     
     // ─── 数据源配置 (文件或 ROS2) ─────────────────────────────
-    // 检查命令行是否有 ROS2 标志
+    // 命令行 ROS2 标志与话题
     bool use_ros2_bag = false;
     bool use_ros2_topics = false;
     std::string ros2_bag_file;
@@ -323,9 +323,39 @@ int main(int argc, char** argv) {
         }
     }
     
+    // 未从命令行指定时，从配置文件 ros2 / sensors 读取默认话题
+    const YAML::Node ros2_node = cfg["ros2"];
+    if (ros2_node) {
+        if (!use_ros2_bag && ros2_node["use_ros2_bag"] && ros2_node["use_ros2_bag"].as<bool>()) {
+            use_ros2_bag = true;
+            if (ros2_bag_file.empty() && ros2_node["ros2_bag_file"])
+                ros2_bag_file = ros2_node["ros2_bag_file"].as<std::string>();
+        }
+        if (!use_ros2_topics && ros2_node["use_ros2_topics"] && ros2_node["use_ros2_topics"].as<bool>())
+            use_ros2_topics = true;
+        if (lidar_ros2_topic.empty() && ros2_node["lidar_topic"])
+            lidar_ros2_topic = ros2_node["lidar_topic"].as<std::string>();
+        if (camera_ros2_topic.empty() && ros2_node["camera_topic"])
+            camera_ros2_topic = ros2_node["camera_topic"].as<std::string>();
+    }
+    if (lidar_ros2_topic.empty() || camera_ros2_topic.empty()) {
+        try {
+            SystemConfig sys_cfg = YamlIO::load_system_config(config_file);
+            for (const auto& s : sys_cfg.sensors) {
+                if (s.type == SensorType::LiDAR && lidar_ros2_topic.empty() && !s.topic.empty()) {
+                    lidar_ros2_topic = s.topic;
+                    pipe_cfg.lidar_id = s.sensor_id;
+                }
+                if (s.type == SensorType::CAMERA && camera_ros2_topic.empty() && !s.topic.empty()) {
+                    camera_ros2_topic = s.topic;
+                    pipe_cfg.camera_id = s.sensor_id;
+                }
+            }
+        } catch (const std::exception&) { /* 忽略，沿用命令行或 ros2 段 */ }
+    }
+    
     // 设置数据源配置
     if (use_ros2_bag && !ros2_bag_file.empty()) {
-        // ROS2 bag 模式
         pipe_cfg.use_ros2_bag = true;
         pipe_cfg.ros2_bag_file = ros2_bag_file;
         pipe_cfg.lidar_ros2_topic = lidar_ros2_topic;
@@ -333,25 +363,19 @@ int main(int argc, char** argv) {
         
         UNICALIB_INFO("配置: 使用 ROS2 bag 模式");
         UNICALIB_INFO("  Bag 文件: {}", ros2_bag_file);
-        if (!lidar_ros2_topic.empty()) {
-            UNICALIB_INFO("  LiDAR 话题: {}", lidar_ros2_topic);
-        }
-        if (!camera_ros2_topic.empty()) {
-            UNICALIB_INFO("  相机话题: {}", camera_ros2_topic);
-        }
-    } else if (use_ros2_topics && (!lidar_ros2_topic.empty() || !camera_ros2_topic.empty())) {
-        // ROS2 实时话题模式
+        UNICALIB_INFO("  LiDAR 话题: {}", pipe_cfg.lidar_ros2_topic.empty() ? "(未设置)" : pipe_cfg.lidar_ros2_topic);
+        UNICALIB_INFO("  相机话题: {}", pipe_cfg.camera_ros2_topic.empty() ? "(未设置)" : pipe_cfg.camera_ros2_topic);
+    } else if (use_ros2_topics) {
         pipe_cfg.use_ros2_topics = true;
         pipe_cfg.lidar_ros2_topic = lidar_ros2_topic;
         pipe_cfg.camera_ros2_topic = camera_ros2_topic;
         
         UNICALIB_INFO("配置: 使用 ROS2 实时话题模式");
-        UNICALIB_INFO("  LiDAR 话题: {}", lidar_ros2_topic);
-        UNICALIB_INFO("  相机话题: {}", camera_ros2_topic);
+        UNICALIB_INFO("  LiDAR 话题: {}", pipe_cfg.lidar_ros2_topic.empty() ? "(未设置)" : pipe_cfg.lidar_ros2_topic);
+        UNICALIB_INFO("  相机话题: {}", pipe_cfg.camera_ros2_topic.empty() ? "(未设置)" : pipe_cfg.camera_ros2_topic);
     } else {
-        // 文件模式 (默认)
-        pipe_cfg.lidar_data_dir          = lidar_dir_resolved;
-        pipe_cfg.camera_images_dir       = camera_dir_resolved;
+        pipe_cfg.lidar_data_dir    = lidar_dir_resolved;
+        pipe_cfg.camera_images_dir = camera_dir_resolved;
     }
 
     CalibPipeline pipeline(pipe_cfg);
