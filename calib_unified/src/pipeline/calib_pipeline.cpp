@@ -8,6 +8,11 @@
  */
 
 #include "unicalib/pipeline/calib_pipeline.h"
+#include "unicalib/extrinsic/lidar_camera_calib.h"
+#include "unicalib/io/yaml_io.h"
+#include "unicalib/io/ros2_data_source.h"
+#include <pcl/io/pcd_io.h>
+#include <opencv2/imgcodecs.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
@@ -15,6 +20,8 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <algorithm>
+#include <cmath>
 
 namespace fs = std::filesystem;
 
@@ -339,7 +346,7 @@ StageResult CalibPipeline::run_coarse_stage(CalibTaskType task) {
 }
 
 // ---------------------------------------------------------------------------
-// 精标定阶段入口 (占位实现)
+// 精标定阶段入口
 // ---------------------------------------------------------------------------
 StageResult CalibPipeline::run_fine_stage(CalibTaskType task) {
     StageResult r;
@@ -381,10 +388,490 @@ StageResult CalibPipeline::run_fine_stage(CalibTaskType task) {
         default: break;
     }
 
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    // ─── LiDAR-Camera 外参精标定 ─────────────────────────────────────────
+    if (task == CalibTaskType::LIDAR_CAM_EXTRIN) {
+        return run_fine_lidar_camera();
+    }
+
+    // ─── 其他任务（占位）─────────────────────────────────────────────────
     r.success  = true;
     r.message  = "精标定占位 — 请通过具体标定器实现";
-    r.elapsed_ms = 0.0;
+    auto t_end = std::chrono::high_resolution_clock::now();
+    r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    UNICALIB_WARN("[Fine-Auto] 任务 {} 当前为占位实现", task_str(task));
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// LiDAR-Camera 精标定实现
+// ---------------------------------------------------------------------------
+StageResult CalibPipeline::run_fine_lidar_camera() {
+    StageResult r;
+    r.stage = CalibStage::FINE_AUTO;
+    r.task  = CalibTaskType::LIDAR_CAM_EXTRIN;
+    r.quality_threshold = cfg_.lidar_cam_rms_threshold;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    // ─── 数据源类型判断 ─────────────────────────────────────────────────
+    enum class DataSourceType {
+        FILES,
+        ROS2_BAG,
+        ROS2_TOPIC
+    };
+    
+    DataSourceType data_source_type = DataSourceType::FILES;
+    if (cfg_.use_ros2_bag && !cfg_.ros2_bag_file.empty()) {
+        data_source_type = DataSourceType::ROS2_BAG;
+    } else if (cfg_.use_ros2_topics && (!cfg_.lidar_ros2_topic.empty() || !cfg_.camera_ros2_topic.empty())) {
+        data_source_type = DataSourceType::ROS2_TOPIC;
+    }
+
+    // ─── 显示数据源信息 ───────────────────────────────────────────────
+    UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 开始执行精标定...");
+    
+    if (data_source_type == DataSourceType::ROS2_BAG) {
+        UNICALIB_INFO("  数据源类型: ROS2 Bag 文件");
+        UNICALIB_INFO("  ROS2 Bag 文件: {}", cfg_.ros2_bag_file);
+        UNICALIB_INFO("  LiDAR 话题: {}", cfg_.lidar_ros2_topic);
+        UNICALIB_INFO("  相机话题: {}", cfg_.camera_ros2_topic);
+    } else if (data_source_type == DataSourceType::ROS2_TOPIC) {
+        UNICALIB_INFO("  数据源类型: ROS2 实时话题订阅");
+        UNICALIB_INFO("  LiDAR 话题: {}", cfg_.lidar_ros2_topic);
+        UNICALIB_INFO("  相机话题: {}", cfg_.camera_ros2_topic);
+        UNICALIB_INFO("  最大等待时间: {:.1f} 秒", cfg_.ros2_max_wait_time);
+    } else {
+        UNICALIB_INFO("  数据源类型: 文件系统");
+        UNICALIB_INFO("  LiDAR 数据目录: {}",
+                      cfg_.lidar_data_dir.empty() ? "(未设置)" : cfg_.lidar_data_dir);
+        UNICALIB_INFO("  相机图像目录: {}",
+                      cfg_.camera_images_dir.empty() ? "(未设置)" : cfg_.camera_images_dir);
+    }
+
+    // ─── 1. 数据路径/配置验证 ───────────────────────────────────────
+    if (data_source_type == DataSourceType::FILES) {
+        if (cfg_.lidar_data_dir.empty() || cfg_.camera_images_dir.empty()) {
+            r.success = false;
+            r.message = "数据路径未配置 — 请在 PipelineConfig 中设置 lidar_data_dir 和 camera_images_dir";
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+            return r;
+        }
+
+        if (!fs::exists(cfg_.lidar_data_dir)) {
+            r.success = false;
+            r.message = "LiDAR 数据目录不存在: " + cfg_.lidar_data_dir;
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+            return r;
+        }
+
+        if (!fs::exists(cfg_.camera_images_dir)) {
+            r.success = false;
+            r.message = "相机图像目录不存在: " + cfg_.camera_images_dir;
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+            return r;
+        }
+    } else if (data_source_type == DataSourceType::ROS2_BAG) {
+        if (!fs::exists(cfg_.ros2_bag_file)) {
+            r.success = false;
+            r.message = "ROS2 Bag 文件不存在: " + cfg_.ros2_bag_file;
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+            return r;
+        }
+    }
+
+    // ─── 2. 加载 LiDAR 和相机数据 (文件或 ROS2) ─────────────────────────
+    std::vector<LiDARScan> lidar_scans;
+    std::vector<std::pair<double, cv::Mat>> camera_frames;
+
+    if (data_source_type == DataSourceType::FILES) {
+        // 从文件加载数据
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 从文件加载点云...");
+        
+        std::vector<fs::path> pcd_files;
+        for (const auto& entry : fs::directory_iterator(cfg_.lidar_data_dir)) {
+            if (entry.path().extension() == ".pcd" || entry.path().extension() == ".PCD") {
+                pcd_files.push_back(entry.path());
+            }
+        }
+        std::sort(pcd_files.begin(), pcd_files.end());
+
+        if (pcd_files.empty()) {
+            r.success = false;
+            r.message = "未找到 PCD 文件: " + cfg_.lidar_data_dir;
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+            return r;
+        }
+
+        const size_t MAX_FRAMES = 100;
+        size_t step = std::max(size_t(1), pcd_files.size() / MAX_FRAMES);
+
+        for (size_t i = 0; i < pcd_files.size() && lidar_scans.size() < MAX_FRAMES; i += step) {
+            LiDARScan scan;
+            scan.cloud.reset(new pcl::PointCloud<pcl::PointXYZI>);
+            if (pcl::io::loadPCDFile<pcl::PointXYZI>(pcd_files[i].string(), *scan.cloud) == 0) {
+                std::string fname = pcd_files[i].stem().string();
+                try {
+                    scan.timestamp = std::stod(fname);
+                } catch (...) {
+                    scan.timestamp = static_cast<double>(i) * 0.1;
+                }
+                lidar_scans.push_back(std::move(scan));
+            } else {
+                UNICALIB_WARN("[Fine-Auto/LiDAR-Cam] 加载失败: {}", pcd_files[i].string());
+            }
+        }
+
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 加载 {} 帧点云 (共 {} 文件)",
+                      lidar_scans.size(), pcd_files.size());
+
+        if (lidar_scans.empty()) {
+            r.success = false;
+            r.message = "未能成功加载任何点云";
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            return r;
+        }
+
+        // 从文件加载相机图像
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 从文件加载图像...");
+    std::vector<std::pair<double, cv::Mat>> camera_frames;
+
+    std::vector<fs::path> img_files;
+    for (const auto& entry : fs::directory_iterator(cfg_.camera_images_dir)) {
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp") {
+            img_files.push_back(entry.path());
+        }
+    }
+    std::sort(img_files.begin(), img_files.end());
+
+    if (img_files.empty()) {
+        r.success = false;
+        r.message = "未找到图像文件: " + cfg_.camera_images_dir;
+        auto t_end = std::chrono::high_resolution_clock::now();
+        r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+        return r;
+    }
+
+        size_t img_step = std::max(size_t(1), img_files.size() / MAX_FRAMES);
+        for (size_t i = 0; i < img_files.size() && camera_frames.size() < MAX_FRAMES; i += img_step) {
+            cv::Mat img = cv::imread(img_files[i].string());
+            if (!img.empty()) {
+                std::string fname = img_files[i].stem().string();
+                double ts;
+                try {
+                    ts = std::stod(fname);
+                } catch (...) {
+                    ts = static_cast<double>(i) * 0.1;
+                }
+                camera_frames.emplace_back(ts, img);
+            }
+        }
+
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 加载 {} 帧图像 (共 {} 文件)",
+                      camera_frames.size(), img_files.size());
+
+        if (camera_frames.empty()) {
+            r.success = false;
+            r.message = "未能成功加载任何图像";
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            return r;
+        }
+    } else if (data_source_type == DataSourceType::ROS2_BAG || 
+               data_source_type == DataSourceType::ROS2_TOPIC) {
+        // 从 ROS2 加载数据
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 从 ROS2 加载数据...");
+        
+        // 配置 ROS2 数据源
+        RosDataSourceConfig ros_cfg;
+        ros_cfg.bag_file = cfg_.ros2_bag_file;
+        ros_cfg.realtime_mode = (data_source_type == DataSourceType::ROS2_TOPIC);
+        ros_cfg.realtime_timeout = cfg_.ros2_max_wait_time;
+        ros_cfg.sample_interval = cfg_.ros2_sample_interval;
+        ros_cfg.max_frames = cfg_.ros2_max_frames;
+        
+        // 设置话题映射
+        if (!cfg_.lidar_ros2_topic.empty()) {
+            ros_cfg.lidar_topics[cfg_.lidar_id] = cfg_.lidar_ros2_topic;
+        }
+        if (!cfg_.camera_ros2_topic.empty()) {
+            ros_cfg.camera_topics[cfg_.camera_id] = cfg_.camera_ros2_topic;
+        }
+        
+        // 创建 ROS2 数据源
+        UnifiedDataLoader::Config unified_cfg;
+        unified_cfg.source_type = (data_source_type == DataSourceType::ROS2_BAG) ?
+            UnifiedDataLoader::SourceType::ROS2_BAG :
+            UnifiedDataLoader::SourceType::ROS2_TOPIC;
+        unified_cfg.ros_config = ros_cfg;
+        unified_cfg.max_frames = cfg_.ros2_max_frames;
+        
+        UnifiedDataLoader loader(unified_cfg);
+        
+        // 加载数据
+        if (!loader.load()) {
+            r.success = false;
+            r.message = "ROS2 数据加载失败: " + loader.get_status_message();
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+            return r;
+        }
+        
+        // 转换数据
+        lidar_scans = loader.to_lidar_scans(cfg_.lidar_id);
+        camera_frames = loader.to_camera_frames(cfg_.camera_id);
+        
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 从 ROS2 加载完成:");
+        UNICALIB_INFO("  LiDAR: {} 帧", lidar_scans.size());
+        UNICALIB_INFO("  相机: {} 帧", camera_frames.size());
+        
+        if (lidar_scans.empty()) {
+            r.success = false;
+            r.message = "未能从 ROS2 加载 LiDAR 数据";
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            return r;
+        }
+        
+        if (camera_frames.empty()) {
+            r.success = false;
+            r.message = "未能从 ROS2 加载相机数据";
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            return r;
+        }
+    }
+
+    // ─── 4. 加载/默认相机内参 ─────────────────────────────────────────────
+    CameraIntrinsics cam_intrin;
+    if (!cfg_.camera_intrinsic_file.empty() && fs::exists(cfg_.camera_intrinsic_file)) {
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 加载内参: {}", cfg_.camera_intrinsic_file);
+        try {
+            YAML::Node intrin_node = YAML::LoadFile(cfg_.camera_intrinsic_file);
+            cam_intrin.fx     = intrin_node["fx"].as<double>(0.0);
+            cam_intrin.fy     = intrin_node["fy"].as<double>(0.0);
+            cam_intrin.cx     = intrin_node["cx"].as<double>(0.0);
+            cam_intrin.cy     = intrin_node["cy"].as<double>(0.0);
+            cam_intrin.width  = intrin_node["width"].as<int>(0);
+            cam_intrin.height = intrin_node["height"].as<int>(0);
+            if (intrin_node["dist_coeffs"]) {
+                for (const auto& d : intrin_node["dist_coeffs"]) {
+                    cam_intrin.dist_coeffs.push_back(d.as<double>());
+                }
+            }
+            UNICALIB_INFO("  内参: fx={:.1f} fy={:.1f} cx={:.1f} cy={:.1f} {}x{}",
+                          cam_intrin.fx, cam_intrin.fy, cam_intrin.cx, cam_intrin.cy,
+                          cam_intrin.width, cam_intrin.height);
+        } catch (const std::exception& e) {
+            UNICALIB_WARN("[Fine-Auto/LiDAR-Cam] 内参加载失败: {}，使用图像尺寸推断", e.what());
+            cam_intrin = infer_intrinsics_from_images(camera_frames);
+        }
+    } else {
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 未提供内参文件，从图像尺寸推断");
+        cam_intrin = infer_intrinsics_from_images(camera_frames);
+    }
+
+    // ─── 5. 调用 LiDARCameraCalibrator ─────────────────────────────────────
+    LiDARCameraCalibrator::Config calib_cfg;
+
+    // 方法选择
+    if (cfg_.lidar_cam_method == "edge") {
+        calib_cfg.method = LiDARCameraCalibrator::Method::EDGE_ALIGNMENT;
+    } else if (cfg_.lidar_cam_method == "target") {
+        calib_cfg.method = LiDARCameraCalibrator::Method::TARGET_CHESSBOARD;
+    } else if (cfg_.lidar_cam_method == "motion") {
+        calib_cfg.method = LiDARCameraCalibrator::Method::MOTION_BSPLINE;
+    } else {
+        calib_cfg.method = cfg_.prefer_targetfree ?
+            LiDARCameraCalibrator::Method::EDGE_ALIGNMENT :
+            LiDARCameraCalibrator::Method::TARGET_CHESSBOARD;
+    }
+
+    calib_cfg.board_cols     = cfg_.board_cols;
+    calib_cfg.board_rows     = cfg_.board_rows;
+    calib_cfg.square_size_m  = cfg_.square_size_m;
+    calib_cfg.edge_canny_low  = cfg_.edge_canny_low;
+    calib_cfg.edge_canny_high = cfg_.edge_canny_high;
+    calib_cfg.ceres_max_iter  = cfg_.ceres_max_iter;
+    calib_cfg.verbose = (cfg_.log_level == "debug" || cfg_.log_level == "trace");
+
+    LiDARCameraCalibrator calibrator(calib_cfg);
+
+    // 进度回调
+    calibrator.set_progress_callback([this](const std::string& step, double prog) {
+        if (prog >= 0) {
+            log_step(CalibStage::FINE_AUTO, step,
+                     "进度 " + std::to_string(static_cast<int>(prog * 100)) + "%");
+        }
+    });
+
+    // 执行两阶段标定
+    Sophus::SE3d init_guess = Sophus::SE3d();  // identity 作为初值
+    auto result = calibrator.calibrate_two_stage(
+        lidar_scans, camera_frames, cam_intrin,
+        std::nullopt,  // 无 AI 粗估初值
+        cfg_.prefer_targetfree,
+        cfg_.lidar_id, cfg_.camera_id);
+
+    // ─── 6. 结果处理 ──────────────────────────────────────────────────────
+    auto t_end = std::chrono::high_resolution_clock::now();
+    r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    if (result.best() != nullptr) {
+        r.success = true;
+        r.residual_rms = result.best_rms();
+        r.needs_manual_refine();  // 更新状态
+
+        std::ostringstream oss;
+        oss << "LiDAR-Camera 精标定成功: 方法=" << result.fine_method
+            << " RMS=" << std::fixed << std::setprecision(3) << result.best_rms() << "px";
+
+        if (result.fine.has_value()) {
+            const auto& T = result.fine->SE3_TargetInRef();
+            Eigen::Vector3d t = T.translation();
+            Eigen::Vector3d rpy = T.so3().log() * 180.0 / M_PI;
+            oss << " t=[" << std::setprecision(3)
+                << t.x() << "," << t.y() << "," << t.z() << "]m"
+                << " rpy=[" << rpy.x() << "," << rpy.y() << "," << rpy.z() << "]deg";
+        }
+
+        r.message = oss.str();
+        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] {}", r.message);
+
+        // 更新参数管理器
+        if (result.fine.has_value() && params_) {
+            auto extrin_ptr = params_->get_or_create_extrinsic(cfg_.lidar_id, cfg_.camera_id);
+            if (extrin_ptr) {
+                *extrin_ptr = *result.fine;
+            }
+        }
+
+        // 保存结果到 YAML
+        std::string result_yaml = cfg_.output_dir + "/lidar_cam_extrinsic.yaml";
+        save_extrinsic_result(result_yaml, result);
+
+        // 生成可视化
+        if (!lidar_scans.empty() && !camera_frames.empty()) {
+            std::string vis_path = cfg_.output_dir + "/lidar_cam_projection.png";
+            calibrator.visualize_projection(
+                lidar_scans[0], camera_frames[0].second,
+                *result.best(), cam_intrin, vis_path);
+        }
+
+    } else {
+        r.success = false;
+        r.residual_rms = -1.0;
+        r.message = "LiDAR-Camera 精标定失败 — 未能收敛或数据不匹配";
+        UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+    }
+
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// 辅助函数: 从图像推断内参
+// ---------------------------------------------------------------------------
+CameraIntrinsics CalibPipeline::infer_intrinsics_from_images(
+    const std::vector<std::pair<double, cv::Mat>>& frames) const {
+
+    CameraIntrinsics intrin;
+    if (frames.empty()) {
+        intrin.width = 1280;
+        intrin.height = 720;
+        intrin.fx = intrin.width / 2.0;
+        intrin.fy = intrin.width / 2.0;
+        intrin.cx = intrin.width / 2.0;
+        intrin.cy = intrin.height / 2.0;
+        UNICALIB_WARN("[Fine-Auto] 无图像数据，使用默认 1280x720 内参");
+        return intrin;
+    }
+
+    const auto& img = frames[0].second;
+    intrin.width = img.cols;
+    intrin.height = img.rows;
+    // 假设约 90 度 FOV (f ≈ width)
+    intrin.fx = intrin.width * 0.9;
+    intrin.fy = intrin.width * 0.9;
+    intrin.cx = intrin.width / 2.0;
+    intrin.cy = intrin.height / 2.0;
+
+    UNICALIB_INFO("[Fine-Auto] 推断内参: {}x{} fx={:.1f} fy={:.1f}",
+                  intrin.width, intrin.height, intrin.fx, intrin.fy);
+    return intrin;
+}
+
+// ---------------------------------------------------------------------------
+// 辅助函数: 保存外参结果
+// ---------------------------------------------------------------------------
+void CalibPipeline::save_extrinsic_result(
+    const std::string& path,
+    const LiDARCameraCalibrator::TwoStageResult& result) const {
+
+    YAML::Emitter out;
+    out << YAML::BeginMap;
+
+    out << YAML::Key << "calibration_type" << YAML::Value << "lidar_camera_extrinsic";
+    out << YAML::Key << "reference_sensor" << YAML::Value << cfg_.lidar_id;
+    out << YAML::Key << "target_sensor" << YAML::Value << cfg_.camera_id;
+    out << YAML::Key << "timestamp" << YAML::Value << now_str();
+
+    if (result.coarse.has_value()) {
+        out << YAML::Key << "coarse_result";
+        out << YAML::BeginMap;
+        const auto& T = result.coarse->SE3_TargetInRef();
+        out << YAML::Key << "method" << YAML::Value << result.coarse_method;
+        out << YAML::Key << "rms" << YAML::Value << result.coarse_rms;
+        out << YAML::Key << "translation" << YAML::Flow << YAML::BeginSeq
+            << T.translation().x() << T.translation().y() << T.translation().z() << YAML::EndSeq;
+        auto rpy = T.so3().log();
+        out << YAML::Key << "rotation_rpy" << YAML::Flow << YAML::BeginSeq
+            << rpy.x() << rpy.y() << rpy.z() << YAML::EndSeq;
+        out << YAML::EndMap;
+    }
+
+    if (result.fine.has_value()) {
+        out << YAML::Key << "fine_result";
+        out << YAML::BeginMap;
+        const auto& T = result.fine->SE3_TargetInRef();
+        out << YAML::Key << "method" << YAML::Value << result.fine_method;
+        out << YAML::Key << "rms" << YAML::Value << result.fine_rms;
+        out << YAML::Key << "converged" << YAML::Value << result.fine->is_converged;
+        out << YAML::Key << "translation" << YAML::Flow << YAML::BeginSeq
+            << T.translation().x() << T.translation().y() << T.translation().z() << YAML::EndSeq;
+        auto rpy = T.so3().log();
+        out << YAML::Key << "rotation_rpy_rad" << YAML::Flow << YAML::BeginSeq
+            << rpy.x() << rpy.y() << rpy.z() << YAML::EndSeq;
+        out << YAML::Key << "rotation_rpy_deg" << YAML::Flow << YAML::BeginSeq
+            << rpy.x() * 180 / M_PI << rpy.y() * 180 / M_PI << rpy.z() * 180 / M_PI << YAML::EndSeq;
+        out << YAML::EndMap;
+    }
+
+    out << YAML::Key << "needs_manual_refine" << YAML::Value << result.needs_manual;
+    out << YAML::Key << "manual_threshold_px" << YAML::Value << result.manual_threshold_px;
+
+    out << YAML::EndMap;
+
+    std::ofstream f(path);
+    if (f.is_open()) {
+        f << out.c_str();
+        UNICALIB_INFO("[Fine-Auto] 结果已保存: {}", path);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -127,6 +127,12 @@ struct SystemConfig {
     std::vector<SensorDesc> sensors;
     std::vector<CalibPair>  calib_pairs;
 
+    // 数据路径 (来自 YAML data.imu / data.lidar / data.camera)，sensor_id -> 路径
+    std::map<std::string, std::string> imu_data_paths;
+    std::map<std::string, std::string> lidar_data_paths;
+    std::map<std::string, std::string> camera_images_dirs;
+    std::map<std::string, std::string> camera_intrinsic_yamls;  // 可选，有内参时可跳过内参标定
+
     // 按 ID 查找传感器
     const SensorDesc* find_sensor(const std::string& id) const;
     std::vector<const SensorDesc*> sensors_of_type(SensorType t) const;
@@ -139,6 +145,10 @@ std::string sensor_type_to_str(SensorType t);
 SensorType  sensor_type_from_str(const std::string& s);
 std::string calib_type_to_str(CalibType t);
 std::string lidar_type_to_str(LidarType t);
+LidarType   lidar_type_from_str(const std::string& s);
 std::string camera_model_to_str(CameraModel m);
+CameraModel camera_model_from_str(const std::string& s);
+std::string imu_model_to_str(IMUModel m);
+IMUModel    imu_model_from_str(const std::string& s);
 
 }  // namespace ns_unicalib

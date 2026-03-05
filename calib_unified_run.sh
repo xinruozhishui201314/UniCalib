@@ -808,6 +808,7 @@ echo ""
 
 "\${EXE}" \
     --config "\${CONFIG}" \
+    --data-dir "${CONTAINER_DATA}" \
     ${task_flags} \
     --log-level ${loglevel} \
     --output-dir "${CONTAINER_RESULTS}" \

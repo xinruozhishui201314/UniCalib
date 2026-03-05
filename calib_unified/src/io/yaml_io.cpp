@@ -9,6 +9,7 @@
 #include "unicalib/io/yaml_io.h"
 #include "unicalib/common/logger.h"
 #include "unicalib/common/exception.h"
+#include "unicalib/common/sensor_types.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -23,6 +24,9 @@ namespace ns_unicalib {
 
 // ===================================================================
 // 读取系统配置 (YAML)
+// 支持两种格式:
+//   1) 统一格式 unicalib_example.yaml: sensors[] + reference_imu + data
+//   2) 旧格式: imu_sensors / lidar_sensors / camera_sensors
 // ===================================================================
 SystemConfig YamlIO::load_system_config(const std::string& yaml_path) {
     UNICALIB_INFO("读取系统配置: {}", yaml_path);
@@ -43,40 +47,109 @@ SystemConfig YamlIO::load_system_config(const std::string& yaml_path) {
     SystemConfig cfg;
     cfg.config_file = yaml_path;
     
-    // IMU 传感器列表 -> cfg.sensors (SensorDesc, type=IMU)
-    if (root["imu_sensors"]) {
-        for (const auto& imu : root["imu_sensors"]) {
+    // ---------- 统一格式: sensors 列表 (id, type, topic, 及嵌套 imu/lidar/camera) ----------
+    if (root["sensors"]) {
+        for (const auto& node : root["sensors"]) {
+            std::string id_str = YAML_GET_OR(node, "id", std::string(""));
+            std::string type_str = YAML_GET_OR(node, "type", std::string(""));
+            SensorType st = sensor_type_from_str(type_str);
             SensorDesc d;
-            d.sensor_id = YAML_GET_OR(imu, "id", std::string(""));
-            d.topic = YAML_GET_OR(imu, "topic", std::string(""));
-            d.type = SensorType::IMU;
-            d.imu_params = SensorDesc::IMUParams{};
-            d.imu_params->rate_hz = YAML_GET_OR(imu, "rate_hz", 200.0);
+            d.sensor_id = id_str;
+            d.topic = YAML_GET_OR(node, "topic", std::string(""));
+            d.type = st;
+            if (st == SensorType::IMU && node["imu"]) {
+                const auto& imu = node["imu"];
+                d.imu_params = SensorDesc::IMUParams{};
+                d.imu_params->rate_hz = YAML_GET_OR(imu, "rate_hz", 200.0);
+                std::string model_str = YAML_GET_OR(imu, "model", std::string("scale_misalignment"));
+                d.imu_params->model = imu_model_from_str(model_str);
+            }
+            if (st == SensorType::LiDAR && node["lidar"]) {
+                const auto& lidar = node["lidar"];
+                d.lidar_params = SensorDesc::LiDARParams{};
+                std::string lt_str = YAML_GET_OR(lidar, "type", std::string("spinning"));
+                d.lidar_params->lidar_type = lidar_type_from_str(lt_str);
+                d.lidar_params->scan_lines = YAML_GET_OR(lidar, "scan_lines", 16);
+                d.lidar_params->rate_hz = YAML_GET_OR(lidar, "rate_hz", 10.0);
+            }
+            if (st == SensorType::CAMERA && node["camera"]) {
+                const auto& cam = node["camera"];
+                d.camera_params = SensorDesc::CameraParams{};
+                std::string cm_str = YAML_GET_OR(cam, "model", std::string("pinhole"));
+                d.camera_params->model = camera_model_from_str(cm_str);
+                d.camera_params->width = YAML_GET_OR(cam, "width", 0);
+                d.camera_params->height = YAML_GET_OR(cam, "height", 0);
+                d.camera_params->fps = YAML_GET_OR(cam, "fps", 30.0);
+                d.camera_params->is_rolling_shutter = YAML_GET_OR(cam, "rolling_shutter", false);
+            }
             cfg.sensors.push_back(d);
         }
     }
     
-    // LiDAR 传感器列表
-    if (root["lidar_sensors"]) {
-        for (const auto& lidar : root["lidar_sensors"]) {
-            SensorDesc d;
-            d.sensor_id = YAML_GET_OR(lidar, "id", std::string(""));
-            d.topic = YAML_GET_OR(lidar, "topic", std::string(""));
-            d.type = SensorType::LiDAR;
-            d.lidar_params = SensorDesc::LiDARParams{};
-            cfg.sensors.push_back(d);
+    // ---------- 旧格式: 独立列表 imu_sensors / lidar_sensors / camera_sensors ----------
+    if (cfg.sensors.empty()) {
+        if (root["imu_sensors"]) {
+            for (const auto& imu : root["imu_sensors"]) {
+                SensorDesc d;
+                d.sensor_id = YAML_GET_OR(imu, "id", std::string(""));
+                d.topic = YAML_GET_OR(imu, "topic", std::string(""));
+                d.type = SensorType::IMU;
+                d.imu_params = SensorDesc::IMUParams{};
+                d.imu_params->rate_hz = YAML_GET_OR(imu, "rate_hz", 200.0);
+                cfg.sensors.push_back(d);
+            }
+        }
+        if (root["lidar_sensors"]) {
+            for (const auto& lidar : root["lidar_sensors"]) {
+                SensorDesc d;
+                d.sensor_id = YAML_GET_OR(lidar, "id", std::string(""));
+                d.topic = YAML_GET_OR(lidar, "topic", std::string(""));
+                d.type = SensorType::LiDAR;
+                d.lidar_params = SensorDesc::LiDARParams{};
+                cfg.sensors.push_back(d);
+            }
+        }
+        if (root["camera_sensors"]) {
+            for (const auto& cam : root["camera_sensors"]) {
+                SensorDesc d;
+                d.sensor_id = YAML_GET_OR(cam, "id", std::string(""));
+                d.topic = YAML_GET_OR(cam, "topic", std::string(""));
+                d.type = SensorType::CAMERA;
+                d.camera_params = SensorDesc::CameraParams{};
+                cfg.sensors.push_back(d);
+            }
         }
     }
     
-    // 相机传感器列表
-    if (root["camera_sensors"]) {
-        for (const auto& cam : root["camera_sensors"]) {
-            SensorDesc d;
-            d.sensor_id = YAML_GET_OR(cam, "id", std::string(""));
-            d.topic = YAML_GET_OR(cam, "topic", std::string(""));
-            d.type = SensorType::CAMERA;
-            d.camera_params = SensorDesc::CameraParams{};
-            cfg.sensors.push_back(d);
+    // reference_imu (统一格式)
+    if (root["reference_imu"])
+        cfg.reference_imu = root["reference_imu"].as<std::string>();
+    // output_dir
+    if (root["output_dir"])
+        cfg.output_dir = root["output_dir"].as<std::string>();
+    // data.bag_file, data.imu, data.lidar, data.camera
+    if (root["data"]) {
+        const auto& data = root["data"];
+        if (data["bag_file"]) cfg.bag_file = data["bag_file"].as<std::string>();
+        if (data["imu"]) {
+            for (const auto& kv : data["imu"]) {
+                std::string id = kv.first.as<std::string>();
+                cfg.imu_data_paths[id] = kv.second.as<std::string>();
+            }
+        }
+        if (data["lidar"]) {
+            for (const auto& kv : data["lidar"]) {
+                std::string id = kv.first.as<std::string>();
+                cfg.lidar_data_paths[id] = kv.second.as<std::string>();
+            }
+        }
+        if (data["camera"]) {
+            for (const auto& kv : data["camera"]) {
+                std::string id = kv.first.as<std::string>();
+                const auto& cam = kv.second;
+                if (cam["images_dir"]) cfg.camera_images_dirs[id] = cam["images_dir"].as<std::string>();
+                if (cam["intrinsic_yaml"]) cfg.camera_intrinsic_yamls[id] = cam["intrinsic_yaml"].as<std::string>();
+            }
         }
     }
     
@@ -88,6 +161,10 @@ SystemConfig YamlIO::load_system_config(const std::string& yaml_path) {
     }
     UNICALIB_INFO("  IMU: {}, LiDAR: {}, Camera: {}",
                   n_imu, n_lidar, n_cam);
+    if (cfg.sensors.empty()) {
+        UNICALIB_THROW_DATA(ErrorCode::INVALID_CONFIG,
+            "系统配置中未定义任何传感器 (sensors 或 imu_sensors/lidar_sensors/camera_sensors 至少一项非空); file=" + yaml_path);
+    }
     return cfg;
 }
 
@@ -123,8 +200,10 @@ IMURawData YamlIO::load_imu_csv(const std::string& csv_path) {
     std::string line;
     bool header_skipped = false;
     int skip_count = 0;
+    size_t line_no = 0;
     
     while (std::getline(ifs, line)) {
+        ++line_no;
         // 跳过空行和注释
         if (line.empty() || line[0] == '#') continue;
         
@@ -147,12 +226,22 @@ IMURawData YamlIO::load_imu_csv(const std::string& csv_path) {
             ++skip_count;
             continue;
         }
+        bool finite_gyro = std::isfinite(f.gyro[0]) && std::isfinite(f.gyro[1]) && std::isfinite(f.gyro[2]);
+        bool finite_accel = std::isfinite(f.accel[0]) && std::isfinite(f.accel[1]) && std::isfinite(f.accel[2]);
+        if (!std::isfinite(f.timestamp) || !finite_gyro || !finite_accel) {
+            UNICALIB_WARN("  IMU CSV 第 {} 行含非有限值，已跳过", line_no);
+            ++skip_count;
+            continue;
+        }
         data.push_back(f);
     }
     
     UNICALIB_INFO("  加载 {} 帧 (跳过 {} 行)",
                   data.size(), skip_count);
-    
+    if (data.empty()) {
+        UNICALIB_THROW_DATA(ErrorCode::INSUFFICIENT_DATA,
+            "IMU CSV 未解析到有效帧: " + csv_path + " (共处理 " + std::to_string(line_no) + " 行)");
+    }
     if (data.size() > 1) {
         double dur = data.back().timestamp - data.front().timestamp;
         double dt  = dur / (data.size() - 1);

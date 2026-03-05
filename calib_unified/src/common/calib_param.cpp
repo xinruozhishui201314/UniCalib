@@ -170,7 +170,12 @@ void CalibParamManager::save_yaml(const std::string& path) const {
         UNICALIB_THROW_DATA(ErrorCode::FILE_WRITE_ERROR,
                            "无法打开文件写入标定参数: " + path);
     }
-    f << out.c_str();
+    try {
+        f << out.c_str();
+    } catch (const std::exception& e) {
+        UNICALIB_THROW_DATA(ErrorCode::FILE_WRITE_ERROR,
+            "写入标定参数时发生异常 path=" + path + " detail=" + e.what());
+    }
     UNICALIB_INFO("CalibParams saved to: {}", path);
 }
 
@@ -183,7 +188,6 @@ void CalibParamManager::save_json(const std::string& path) const {
 
 void CalibParamManager::load_yaml(const std::string& path) {
     UNICALIB_INFO("CalibParamManager::load_yaml: {}", path);
-    // 加载 YAML 格式的标定结果
     try {
         YAML::Node root = YAML::LoadFile(path);
 
@@ -224,7 +228,7 @@ void CalibParamManager::load_yaml(const std::string& path) {
         throw;
     } catch (const std::exception& e) {
         UNICALIB_THROW_DATA(ErrorCode::DATA_PARSE_ERROR,
-                            "load_yaml 失败: " + std::string(e.what()));
+            "load_yaml 失败 path=" + path + " detail=" + e.what());
     }
 }
 

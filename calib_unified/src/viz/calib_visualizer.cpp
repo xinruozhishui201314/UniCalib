@@ -43,7 +43,12 @@ CalibVisualizer::CalibVisualizer(const VizConfig& config)
 
     // 创建截图目录
     if (!config_.screenshot_dir.empty()) {
-        fs::create_directories(config_.screenshot_dir);
+        std::error_code ec;
+        fs::create_directories(config_.screenshot_dir, ec);
+        if (ec) {
+            UNICALIB_THROW_SYSTEM(ErrorCode::FILE_WRITE_ERROR,
+                "CalibVisualizer 无法创建截图目录: " + config_.screenshot_dir + " (" + ec.message() + ")");
+        }
     }
 
     UNICALIB_INFO("[CalibVisualizer] 初始化完成");
@@ -84,7 +89,12 @@ CloudViewer::Ptr CalibVisualizer::get_cloud_viewer() {
 void CalibVisualizer::show_imu_lidar_result(const IMULiDARVizData& data, bool block) {
     (void)block;
     if (!cloud_viewer_) {
-        cloud_viewer_ = std::make_shared<CloudViewer>(config_.window_title, config_.enable_background_thread);
+        try {
+            cloud_viewer_ = std::make_shared<CloudViewer>(config_.window_title, config_.enable_background_thread);
+        } catch (const std::exception& e) {
+            UNICALIB_THROW_SYSTEM(ErrorCode::DISPLAY_INIT_FAILED,
+                "CalibVisualizer 创建 CloudViewer 失败: " + std::string(e.what()));
+        }
     }
 
     // 清除之前的可视化
@@ -318,11 +328,24 @@ void CalibVisualizer::show_cloud_alignment(const std::vector<LiDARScan>& scans_b
 // 保存和报告
 // ===========================================================================
 void CalibVisualizer::save_calibration_results(const CalibParamManager& params, const std::string& output_dir, const std::string& format) {
-    fs::create_directories(output_dir);
+    std::error_code ec;
+    fs::create_directories(output_dir, ec);
+    if (ec) {
+        UNICALIB_THROW_SYSTEM(ErrorCode::FILE_WRITE_ERROR,
+            "save_calibration_results 无法创建目录: " + output_dir + " (" + ec.message() + ")");
+    }
 
-    // 生成报告
+    if (!report_generator_) {
+        UNICALIB_THROW_SYSTEM(ErrorCode::INTERNAL_ERROR,
+            "save_calibration_results report_generator_ 为空");
+    }
     std::string report_path = output_dir + "/calibration_report." + format;
-    report_generator_->generate(report_path);
+    try {
+        report_generator_->generate(report_path);
+    } catch (const std::exception& e) {
+        UNICALIB_THROW(ErrorCode::REPORT_GENERATION_FAILED,
+            "生成标定报告失败 path=" + report_path + " detail=" + e.what());
+    }
 
     // 保存可视化数据
     for (const auto& [key, data] : viz_data_) {

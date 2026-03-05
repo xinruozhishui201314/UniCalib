@@ -26,6 +26,9 @@
 
 #include "unicalib/common/logger.h"
 #include "unicalib/common/calib_param.h"
+#include "unicalib/common/sensor_types.h"
+#include "unicalib/extrinsic/lidar_camera_calib.h"
+#include <opencv2/core.hpp>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -158,6 +161,38 @@ struct PipelineConfig {
 
     // 无目标优先 (false 则允许使用靶标方法)
     bool prefer_targetfree          = true;
+
+    // ─── 数据路径配置 (LiDAR-Camera 标定) ───
+    std::string lidar_data_dir;              // LiDAR 点云目录 (PCD)
+    std::string camera_images_dir;           // 相机图像目录
+    std::string camera_intrinsic_file;       // 相机内参 YAML (可选)
+    std::string lidar_id        = "lidar_front";
+    std::string camera_id       = "cam_left";
+
+    // ─── ROS2 数据源配置 (新增) ───
+    bool use_ros2_bag = false;             // 是否使用 ROS2 bag 文件
+    std::string ros2_bag_file;             // ROS2 bag 文件路径
+    bool use_ros2_topics = false;          // 是否使用 ROS2 实时话题订阅
+    std::string lidar_ros2_topic;          // LiDAR ROS2 话题 (如 /velodyne_points)
+    std::string camera_ros2_topic;         // 相机 ROS2 话题 (如 /cam_left/image_raw)
+    std::string imu_ros2_topic;           // IMU ROS2 话题 (如 /imu/data)
+    double ros2_max_wait_time = 30.0;     // ROS2 实时模式最大等待时间(秒)
+    double ros2_sample_interval = 0.0;     // ROS2 数据采样间隔(秒)
+    size_t ros2_max_frames = 100;         // ROS2 最大帧数限制
+
+    // ─── LiDAR-Camera 标定参数 ───
+    // 方法: "edge"(无目标边缘对齐) | "target"(棋盘格) | "motion"(B样条运动)
+    std::string lidar_cam_method = "edge";
+
+    // 棋盘格参数 (method=target 时使用)
+    int    board_cols      = 9;
+    int    board_rows      = 6;
+    double square_size_m   = 0.025;
+
+    // 边缘对齐参数 (method=edge 时使用)
+    int    edge_canny_low  = 50;
+    int    edge_canny_high = 150;
+    int    ceres_max_iter  = 50;
 };
 
 // ===========================================================================
@@ -230,6 +265,20 @@ protected:
 
     // 阶段子日志 (每个 stage 独立文件)
     std::map<std::string, std::shared_ptr<spdlog::logger>> stage_loggers_;
+
+    // -----------------------------------------------------------------------
+    // LiDAR-Camera 精标定内部实现
+    // -----------------------------------------------------------------------
+    StageResult run_fine_lidar_camera();
+
+    // 从图像推断内参 (无内参文件时使用)
+    CameraIntrinsics infer_intrinsics_from_images(
+        const std::vector<std::pair<double, cv::Mat>>& frames) const;
+
+    // 保存外参结果到 YAML
+    void save_extrinsic_result(
+        const std::string& path,
+        const LiDARCameraCalibrator::TwoStageResult& result) const;
 };
 
 }  // namespace ns_unicalib

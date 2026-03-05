@@ -92,15 +92,38 @@ data:
   imu:
     imu_0: /path/to/imu_data/imu.csv
 
-  # LiDAR：每个 lidar id 对应点云目录或 bag 内 topic
+  # LiDAR：每个 lidar id 对应点云目录（PCD 等）；相对路径相对于 CALIB_DATA_DIR（--data-dir/--dataset 指向的目录）
+  # 例：--dataset nya_02_ros2 时填 pcd 表示 <数据根>/nya_02_ros2/pcd
   lidar:
-    lidar_front: /path/to/lidar_scans/
+    lidar_front: pcd
 
-  # 相机：每个 camera id 下可指定 images_dir 或 intrinsic_yaml（内参已知时）
+  # 相机：每个 camera id 下可指定 images_dir 或 intrinsic_yaml（内参已知时）；相对路径相对于 CALIB_DATA_DIR
+  # 例：images 表示 <数据根>/<dataset>/images；若为 /path/to/xxx 占位符会在有 --data-dir 时解析为 <数据根>/xxx
   camera:
     cam_left:
-      images_dir: /path/to/cam_left/images/
+      images_dir: images
       # intrinsic_yaml: /path/to/cam_left_intrinsic.yaml  # 有内参时可跳过内参标定
+
+# ---------------------------------------------------------------------------
+# ROS2 数据源配置 (新增)
+# ---------------------------------------------------------------------------
+ros2:
+  # 启用 ROS2 bag 文件读取 (优先于文件模式)
+  use_ros2_bag: false
+  ros2_bag_file: /path/to/data.bag  # ROS2 bag 文件路径 (绝对路径或相对 CALIB_DATA_DIR)
+  
+  # 启用 ROS2 实时话题订阅 (用于在线标定)
+  use_ros2_topics: false
+  
+  # ROS2 话题名称 (对应 sensors[].topic)
+  lidar_topic: /velodyne_points      # LiDAR 点云话题
+  camera_topic: /cam_left/image_raw  # 相机图像话题
+  imu_topic: /imu/data               # IMU 数据话题
+  
+  # ROS2 数据采集参数
+  max_wait_time: 30.0       # 实时模式最大等待时间 (秒)
+  sample_interval: 0.0      # 数据采样间隔 (秒, 0=不跳过)
+  max_frames: 100          # 最大帧数限制 (0=无限制)
 
 # ---------------------------------------------------------------------------
 # IMU 内参标定参数

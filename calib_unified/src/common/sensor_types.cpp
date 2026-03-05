@@ -64,6 +64,12 @@ std::string lidar_type_to_str(LidarType t) {
     }
 }
 
+LidarType lidar_type_from_str(const std::string& s) {
+    if (s == "spinning")     return LidarType::SPINNING;
+    if (s == "solid_state")  return LidarType::SOLID_STATE;
+    return LidarType::SPINNING;
+}
+
 std::string camera_model_to_str(CameraModel m) {
     switch (m) {
     case CameraModel::PINHOLE:  return "pinhole";
@@ -71,6 +77,28 @@ std::string camera_model_to_str(CameraModel m) {
     case CameraModel::OMNI:     return "omni";
     default:                    return "unknown";
     }
+}
+
+CameraModel camera_model_from_str(const std::string& s) {
+    if (s == "fisheye") return CameraModel::FISHEYE;
+    if (s == "omni")    return CameraModel::OMNI;
+    return CameraModel::PINHOLE;
+}
+
+std::string imu_model_to_str(IMUModel m) {
+    switch (m) {
+    case IMUModel::SCALE_MISALIGNMENT: return "scale_misalignment";
+    case IMUModel::SCALE_ONLY:         return "scale_only";
+    case IMUModel::BIAS_ONLY:          return "bias_only";
+    default:                           return "scale_misalignment";
+    }
+}
+
+IMUModel imu_model_from_str(const std::string& s) {
+    if (s == "bias_only")          return IMUModel::BIAS_ONLY;
+    if (s == "scale_only")         return IMUModel::SCALE_ONLY;
+    if (s == "scale_misalignment") return IMUModel::SCALE_MISALIGNMENT;
+    return IMUModel::SCALE_MISALIGNMENT;
 }
 
 }  // namespace ns_unicalib

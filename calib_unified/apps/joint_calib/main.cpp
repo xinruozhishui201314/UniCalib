@@ -20,12 +20,16 @@
  *   unicalib_joint --config joint_config.yaml --imu-intrin --imu-lidar --coarse
  */
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include "unicalib/pipeline/calib_pipeline.h"
 #include "unicalib/pipeline/ai_coarse_calib.h"
 #include "unicalib/pipeline/manual_calib.h"
 #include "unicalib/extrinsic/imu_lidar_calib.h"
 #include "unicalib/extrinsic/lidar_camera_calib.h"
 #include "unicalib/extrinsic/cam_cam_calib.h"
+#include "unicalib/solver/joint_calib_solver.h"
+#include "unicalib/intrinsic/imu_intrinsic_calib.h"
+#include "unicalib/intrinsic/camera_calib.h"
 #include "unicalib/io/yaml_io.h"
 #include <yaml-cpp/yaml.h>
 #include <filesystem>
@@ -34,6 +38,89 @@
 
 namespace fs = std::filesystem;
 using namespace ns_unicalib;
+
+// 从 unicalib_example.yaml 各子段落填充 JointCalibSolver::Config，保证每个配置参数都被读取
+static void fill_solver_config_from_yaml(const YAML::Node& root,
+                                         JointCalibSolver::Config& out) {
+#define YG(node, key, def) ((node)[key] ? (node)[key].as<std::decay_t<decltype(def)>>() : (def))
+    if (root["do_imu_intrinsic"])         out.do_imu_intrinsic         = root["do_imu_intrinsic"].as<bool>();
+    if (root["do_camera_intrinsic"])      out.do_camera_intrinsic      = root["do_camera_intrinsic"].as<bool>();
+    if (root["do_imu_lidar_extrinsic"])   out.do_imu_lidar_extrinsic   = root["do_imu_lidar_extrinsic"].as<bool>();
+    if (root["do_lidar_camera_extrinsic"]) out.do_lidar_camera_extrinsic = root["do_lidar_camera_extrinsic"].as<bool>();
+    if (root["do_cam_cam_extrinsic"])     out.do_cam_cam_extrinsic     = root["do_cam_cam_extrinsic"].as<bool>();
+    if (root["do_joint_bspline_refine"])  out.do_joint_bspline_refine   = root["do_joint_bspline_refine"].as<bool>();
+    if (root["verbose"])                  out.verbose                  = root["verbose"].as<bool>();
+    if (root["output_dir"])                out.output_dir               = root["output_dir"].as<std::string>();
+
+    if (root["imu_intrinsic"]) {
+        const auto& n = root["imu_intrinsic"];
+        out.imu_intrin_cfg.static_gyro_threshold   = YG(n, "static_gyro_thresh",  0.05);
+        out.imu_intrin_cfg.static_detect_window   = YG(n, "static_detect_window", 0.5);
+        out.imu_intrin_cfg.min_static_frames      = YG(n, "min_static_frames", 50);
+        out.imu_intrin_cfg.allan_num_tau_points   = YG(n, "allan_num_tau_points", 50);
+    }
+    if (root["camera_intrinsic"]) {
+        const auto& n = root["camera_intrinsic"];
+        out.cam_intrin_cfg.min_images   = YG(n, "min_images", 15);
+        out.cam_intrin_cfg.max_images   = YG(n, "max_images", 100);
+        out.cam_intrin_cfg.max_rms_px   = YG(n, "max_rms_px", 1.5);
+        if (n["target"]) {
+            std::string tt = YG(n["target"], "type", std::string("chessboard"));
+            if (tt == "circles")       out.cam_intrin_cfg.target.type = TargetConfig::Type::CIRCLES_GRID;
+            else if (tt == "asym_circles") out.cam_intrin_cfg.target.type = TargetConfig::Type::ASYMMETRIC_CIRCLES;
+            else                        out.cam_intrin_cfg.target.type = TargetConfig::Type::CHESSBOARD;
+            out.cam_intrin_cfg.target.cols = YG(n["target"], "cols", 9);
+            out.cam_intrin_cfg.target.rows = YG(n["target"], "rows", 6);
+            out.cam_intrin_cfg.target.square_size_m = YG(n["target"], "square_size", 0.025);
+        }
+        std::string model_str = YG(n, "model", std::string("pinhole"));
+        out.cam_intrin_cfg.model = (model_str == "fisheye") ? CameraIntrinsics::Model::FISHEYE : CameraIntrinsics::Model::PINHOLE;
+    }
+    if (root["imu_lidar"]) {
+        const auto& n = root["imu_lidar"];
+        out.imu_lidar_cfg.ndt_resolution    = YG(n, "ndt_resolution", 1.0);
+        out.imu_lidar_cfg.ndt_max_iter      = YG(n, "ndt_max_iter", 30);
+        out.imu_lidar_cfg.spline_dt_s       = YG(n, "spline_dt_s", 0.1);
+        out.imu_lidar_cfg.spline_order      = YG(n, "spline_order", 4);
+        out.imu_lidar_cfg.optimize_time_offset = YG(n, "optimize_time_offset", true);
+        out.imu_lidar_cfg.time_offset_init_s   = YG(n, "time_offset_init", 0.0);
+        out.imu_lidar_cfg.time_offset_max_s   = YG(n, "time_offset_max", 0.2);
+        out.imu_lidar_cfg.min_motion_rot_deg   = YG(n, "min_motion_rot_deg", 3.0);
+    }
+    if (root["lidar_camera"]) {
+        const auto& n = root["lidar_camera"];
+        std::string method_str = YG(n, "method", std::string("target"));
+        out.lidar_cam_cfg.method = (method_str == "edge") ? LiDARCameraCalibrator::Method::EDGE_ALIGNMENT :
+                                   (method_str == "motion") ? LiDARCameraCalibrator::Method::MOTION_BSPLINE :
+                                   LiDARCameraCalibrator::Method::TARGET_CHESSBOARD;
+        out.lidar_cam_cfg.board_cols   = YG(n, "board_cols", 9);
+        out.lidar_cam_cfg.board_rows   = YG(n, "board_rows", 6);
+        out.lidar_cam_cfg.square_size_m = YG(n, "square_size", 0.025);
+        out.lidar_cam_cfg.optimize_time_offset = YG(n, "optimize_time_offset", true);
+    }
+    if (root["cam_cam"]) {
+        const auto& n = root["cam_cam"];
+        std::string method_str = YG(n, "method", std::string("chessboard"));
+        out.cam_cam_cfg.method = (method_str == "essential") ? CamCamCalibrator::Method::ESSENTIAL_MATRIX :
+                                 (method_str == "ba") ? CamCamCalibrator::Method::BUNDLE_ADJUSTMENT :
+                                 CamCamCalibrator::Method::CHESSBOARD_STEREO;
+        out.cam_cam_cfg.target.cols = YG(n, "board_cols", 9);
+        out.cam_cam_cfg.target.rows = YG(n, "board_rows", 6);
+        out.cam_cam_cfg.target.square_size_m = YG(n, "square_size", 0.025);
+        out.cam_cam_cfg.max_rms_px = YG(n, "max_rms_px", 2.0);
+        // fix_intrinsics 对应 StereoCameraCalibrator；CamCamCalibrator 用 target，这里用 ba_optimize_intrinsics 反义
+        if (n["fix_intrinsics"]) out.cam_cam_cfg.ba_optimize_intrinsics = !n["fix_intrinsics"].as<bool>();
+    }
+    if (root["joint_bspline"]) {
+        const auto& n = root["joint_bspline"];
+        out.imu_lidar_cfg.spline_order = YG(n, "spline_order", 4);
+        out.imu_lidar_cfg.spline_dt_s  = YG(n, "spline_dt_s", 0.05);
+        out.imu_lidar_cfg.optimize_gravity = YG(n, "optimize_gravity", true);
+        if (n["max_iterations"]) out.imu_lidar_cfg.ceres_max_iter = n["max_iterations"].as<int>();
+        if (n["optimize_intrinsics"]) out.cam_cam_cfg.ba_optimize_intrinsics = n["optimize_intrinsics"].as<bool>();
+    }
+#undef YG
+}
 
 static void print_banner() {
     std::cout << R"(
@@ -173,9 +260,42 @@ int main(int argc, char** argv) {
         UNICALIB_ERROR("配置加载失败: {}", e.what()); return 1;
     }
 
+    // 系统配置（传感器列表、reference_imu、output_dir、data.bag_file）统一由 YamlIO 读取
+    SystemConfig sys_cfg;
+    try {
+        sys_cfg = YamlIO::load_system_config(config_file);
+        if (!sys_cfg.output_dir.empty()) output_dir = sys_cfg.output_dir;
+    } catch (const ns_unicalib::UniCalibException& e) {
+        UNICALIB_ERROR("系统配置加载失败: {}", e.toString()); return 1;
+    }
+
     if (cfg["output_dir"])   output_dir = cfg["output_dir"].as<std::string>();
     if (cfg["prefer_targetfree"]) prefer_tf = cfg["prefer_targetfree"].as<bool>();
     if (cfg["ai_root"])      ai_root = cfg["ai_root"].as<std::string>();
+
+    // 若 YAML 中存在 do_* 任务开关，则覆盖命令行（联合标定以配置文件为准）
+    bool yaml_has_do_flags = cfg["do_imu_intrinsic"] || cfg["do_camera_intrinsic"] ||
+                             cfg["do_imu_lidar_extrinsic"] || cfg["do_lidar_camera_extrinsic"] ||
+                             cfg["do_cam_cam_extrinsic"];
+    if (yaml_has_do_flags) {
+        if (cfg["do_imu_intrinsic"])         do_imu_intrin = cfg["do_imu_intrinsic"].as<bool>();
+        if (cfg["do_camera_intrinsic"])       do_cam_intrin = cfg["do_camera_intrinsic"].as<bool>();
+        if (cfg["do_imu_lidar_extrinsic"])   do_imu_lidar  = cfg["do_imu_lidar_extrinsic"].as<bool>();
+        if (cfg["do_lidar_camera_extrinsic"]) do_lidar_cam  = cfg["do_lidar_camera_extrinsic"].as<bool>();
+        if (cfg["do_cam_cam_extrinsic"])     do_cam_cam    = cfg["do_cam_cam_extrinsic"].as<bool>();
+        tasks = CalibTaskType::NONE;
+        if (do_imu_intrin) tasks = tasks | CalibTaskType::IMU_INTRINSIC;
+        if (do_cam_intrin) tasks = tasks | CalibTaskType::CAM_INTRINSIC;
+        if (do_imu_lidar)  tasks = tasks | CalibTaskType::IMU_LIDAR_EXTRIN;
+        if (do_lidar_cam)  tasks = tasks | CalibTaskType::LIDAR_CAM_EXTRIN;
+        if (do_cam_cam)    tasks = tasks | CalibTaskType::CAM_CAM_EXTRIN;
+    }
+    if (cfg["verbose"]) log_level = cfg["verbose"].as<bool>() ? "debug" : log_level;
+
+    // 从 YAML 各子段落填充求解器配置，保证 unicalib_example.yaml 中每个参数都被读取
+    JointCalibSolver::Config solver_cfg;
+    fill_solver_config_from_yaml(cfg, solver_cfg);
+    (void)solver_cfg;  // 供后续 pipeline 与 solver 对接时使用
 
     print_task_summary(tasks, do_coarse, do_manual, prefer_tf);
 
@@ -233,7 +353,18 @@ int main(int argc, char** argv) {
 
     // ─── 运行流水线 ───────────────────────────────────────────────────
     UNICALIB_INFO("▶ 开始联合标定流水线...");
-    auto report = pipeline.run();
+    PipelineReport report;
+    try {
+        report = pipeline.run();
+    } catch (const ns_unicalib::UniCalibException& e) {
+        std::cerr << "[UniCalib 异常] " << e.toString() << "\n";
+        UNICALIB_ERROR("流水线异常: {}", e.toString());
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "[标准异常] " << e.what() << "\n";
+        UNICALIB_ERROR("流水线异常: {}", e.what());
+        return 1;
+    }
 
     // ─── 打印最终摘要 ─────────────────────────────────────────────────
     std::cout << "\n";

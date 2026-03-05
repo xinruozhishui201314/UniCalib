@@ -706,4 +706,83 @@ EdgeAlignmentScore LiDARCameraCalibrator::evaluate_edge_alignment(
     return score;
 }
 
+// ===================================================================
+// 两阶段标定 (推荐使用)
+// ===================================================================
+LiDARCameraCalibrator::TwoStageResult LiDARCameraCalibrator::calibrate_two_stage(
+    const std::vector<LiDARScan>& lidar_scans,
+    const std::vector<std::pair<double, cv::Mat>>& camera_frames,
+    const CameraIntrinsics& cam_intrin,
+    const std::optional<Sophus::SE3d>& coarse_init,
+    bool prefer_targetfree,
+    const std::string& lidar_id,
+    const std::string& cam_id) {
+
+    TwoStageResult result;
+    result.manual_threshold_px = cfg_.max_reproj_error_px;
+
+    UNICALIB_INFO("=== LiDAR-Camera 两阶段标定 ===");
+    UNICALIB_INFO("  点云帧数: {}", lidar_scans.size());
+    UNICALIB_INFO("  图像帧数: {}", camera_frames.size());
+    UNICALIB_INFO("  优先无目标: {}", prefer_targetfree);
+
+    if (lidar_scans.empty() || camera_frames.empty()) {
+        UNICALIB_ERROR("数据不足，无法标定");
+        return result;
+    }
+
+    // ─── Stage 1: 粗标定 (如果提供了初值则跳过) ───
+    Sophus::SE3d init_T = coarse_init.value_or(Sophus::SE3d());
+
+    if (coarse_init.has_value()) {
+        result.coarse = ExtrinsicSE3();
+        result.coarse->ref_sensor_id = lidar_id;
+        result.coarse->target_sensor_id = cam_id;
+        result.coarse->set_SE3(*coarse_init);
+        result.coarse_method = "provided_init";
+        result.coarse_rms = -1.0;
+        UNICALIB_INFO("[Coarse] 使用提供的初始值");
+    } else {
+        // 使用 identity 作为初值
+        result.coarse_method = "identity";
+        UNICALIB_INFO("[Coarse] 使用 identity 作为初始值");
+    }
+
+    // ─── Stage 2: 精标定 ───
+    std::optional<ExtrinsicSE3> fine_result;
+
+    if (prefer_targetfree) {
+        // 无目标边缘对齐
+        UNICALIB_INFO("[Fine] 执行边缘对齐优化...");
+        fine_result = calibrate_edge_align(lidar_scans, camera_frames, cam_intrin,
+                                           init_T, lidar_id, cam_id);
+        result.fine_method = "EDGE_ALIGNMENT";
+    } else {
+        // 棋盘格目标法
+        UNICALIB_INFO("[Fine] 执行棋盘格目标标定...");
+        fine_result = calibrate_target(lidar_scans, camera_frames, cam_intrin,
+                                       lidar_id, cam_id);
+        result.fine_method = "TARGET_CHESSBOARD";
+    }
+
+    if (fine_result.has_value()) {
+        result.fine = fine_result;
+        result.fine_rms = fine_result->residual_rms;
+        result.needs_manual = (result.fine_rms > result.manual_threshold_px);
+
+        UNICALIB_INFO("[Fine] 标定完成: RMS={:.3f}px converged={}",
+                      result.fine_rms, fine_result->is_converged);
+
+        if (result.needs_manual) {
+            UNICALIB_WARN("[Fine] RMS={:.3f}px > 阈值={:.3f}px，建议手动校准",
+                          result.fine_rms, result.manual_threshold_px);
+        }
+    } else {
+        UNICALIB_ERROR("[Fine] 标定失败");
+        result.fine_method = "FAILED";
+    }
+
+    return result;
+}
+
 }  // namespace ns_unicalib
