@@ -40,7 +40,7 @@ list(APPEND CMAKE_MODULE_PATH
 )
 
 # ---------------------------------------------------------------------------
-# 选项
+# 选项：B-样条与可视化独立控制
 # ---------------------------------------------------------------------------
 option(UNICALIB_BUILD_APPS      "Build application executables"        ON)
 option(UNICALIB_WITH_ROS2       "Enable optional ROS2 bag reading"     OFF)
@@ -48,9 +48,28 @@ option(UNICALIB_WITH_PCL_VIZ    "Enable PCL visualizer"                ON)
 option(UNICALIB_WITH_OPENMP     "Enable OpenMP parallelism"            ON)
 option(UNICALIB_WITH_PYTHON_BRIDGE "Enable AI coarse calib (Python)"   ON)
 option(UNICALIB_BUILD_TESTS      "Build unit tests"                     OFF)
-# iKalibr B-spline engine: requires velodyne_msgs, full ROS2, ufomap, opengv.
-# Default ON; set OFF for quick lean builds (e.g. -DUNICALIB_WITH_IKALIBR=OFF).
-option(UNICALIB_WITH_IKALIBR    "Build iKalibr B-spline calibration engine" ON)
+
+# B-样条求解器（基于 basalt-headers）
+# - 无 ROS 强制依赖，仅需 Ceres
+# - 可与任何可视化后端组合
+option(UNICALIB_WITH_IKALIBR
+    "Build B-spline solver core (requires Ceres, Eigen, Sophus)"
+    ON)
+
+# Pangolin 3D 可视化（本地库，推荐）
+# - 纯 C++，依赖 OpenGL/X11，无 ROS
+# - 支持轨迹、点云、优化曲线交互显示
+option(UNICALIB_WITH_PANGOLIN
+    "Use Pangolin for 3D visualization (OpenGL backend)"
+    ON)
+
+# ROS RViz 可视化（可选）
+# - 仅在 ROS2 环境有效
+# - 与 Pangolin 互斥（Pangolin 优先）
+option(UNICALIB_WITH_ROS_RVIZ
+    "Enable ROS RViz visualization adapter (requires ROS2)"
+    OFF)
+
 option(BUILD_TESTING            "Build tests"                          OFF)
 
 # ---------------------------------------------------------------------------
@@ -126,6 +145,41 @@ target_include_directories(tiny_viewer_stub INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/tiny-viewer-stub
     ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ctraj_full/tiny-viewer_stub)
 add_library(tiny_viewer::stub ALIAS tiny_viewer_stub)
+
+# ===========================================================================
+# 第三方库：basalt-headers（B-样条核心，header-only）
+# ===========================================================================
+# 来源：https://gitlab.com/VladyslavUsenko/basalt-headers.git
+# 功能：
+#   - Se3Spline<N, Scalar>: SE(3) 均匀 B-样条（分割表示法）
+#   - So3Spline<N, Scalar>: SO(3) 累积 B-样条
+#   - RdSpline<DIM, N, Scalar>: R^d 欧氏 B-样条
+#   - CeresSplineHelper: Ceres 自动求导集成
+#   - CeresLocalParamSE3: SE(3) 李群参数化
+
+set(BASALT_HEADERS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/basalt-headers)
+
+if(NOT EXISTS "${BASALT_HEADERS_DIR}/include/basalt/spline/se3_spline.h")
+    message(FATAL_ERROR 
+        "basalt-headers not found at ${BASALT_HEADERS_DIR}. "
+        "Expected: ${BASALT_HEADERS_DIR}/include/basalt/spline/se3_spline.h")
+endif()
+
+# 创建 INTERFACE 库
+add_library(basalt_headers INTERFACE)
+target_include_directories(basalt_headers INTERFACE
+    ${BASALT_HEADERS_DIR}/include)
+
+# basalt-headers 本身需要 Eigen3 和 Sophus
+target_link_libraries(basalt_headers INTERFACE
+    Eigen3::Eigen
+    Sophus::Sophus)
+
+# 别名
+add_library(basalt::headers ALIAS basalt_headers)
+
+message(STATUS "basalt-headers: ✓ Found at ${BASALT_HEADERS_DIR}/include")
+message(STATUS "  • Features: Se3Spline, So3Spline, RdSpline, CeresHelper")
 
 # ---------------------------------------------------------------------------
 # 第三方库: Pangolin 0.9.0 (C++ 可视化, 替代 tiny-viewer)
@@ -468,70 +522,209 @@ set(IKALIBR_MINIMAL_FOR_IMU_LIDAR
     src/ikalibr/core/lidar_odometer.cpp
 )
 
-# iKalibr sources are optional (requires full ROS2 + velodyne_msgs + ufomap + opengv)
+# ===========================================================================
+# 核心库构造：三层解耦
+# ===========================================================================
+
+# ─────────────────────────────────────────────────────────────────────────
+# 第 1 层检查：B-样条求解器的前置条件
+# ─────────────────────────────────────────────────────────────────────────
 if(UNICALIB_WITH_IKALIBR)
-    add_compile_definitions(UNICALIB_WITH_IKALIBR=1)
-    message(STATUS "iKalibr: enabled (full B-spline engine)")
-    set(_UNICALIB_SOURCES ${IKALIBR_CORE_SOURCES} ${IKALIBR_LOADER_SOURCES} ${UNICALIB_NEW_SOURCES})
-    if(UNICALIB_WITH_PANGOLIN)
-      list(APPEND _UNICALIB_SOURCES
+    message(STATUS "iKalibr: checking dependencies...")
+    
+    # B-样条求解需要 Ceres
+    if(NOT Ceres_FOUND)
+        message(FATAL_ERROR
+            "iKalibr requires Ceres but it was not found. "
+            "Installation: sudo apt install libceres-dev")
+    endif()
+    
+    # B-样条求解需要 Sophus（李群库）
+    if(NOT Sophus_FOUND)
+        message(FATAL_ERROR
+            "iKalibr requires Sophus but it was not found. "
+            "Installation: sudo apt install libsophus-dev")
+    endif()
+    
+    message(STATUS "iKalibr: dependencies ✓ (Ceres, Sophus, Eigen3)")
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────
+# 第 2 层选择：可视化后端（互斥：Pangolin > RViz > Stub）
+# ─────────────────────────────────────────────────────────────────────────
+
+set(_VIEWER_SOURCES)
+set(_VIEWER_BACKEND "NONE")
+
+if(UNICALIB_WITH_PANGOLIN)
+    # Pangolin 优先级最高（本地库，无额外依赖）
+    
+    # Pangolin 已在行 155-180 配置好
+    if(NOT TARGET pangolin)
+        message(FATAL_ERROR "Pangolin target not found. Check CMakeLists.txt around line 155")
+    endif()
+    
+    # 添加 viewer 实现
+    list(APPEND _VIEWER_SOURCES
         src/ikalibr/viewer/viewer.cpp
         src/ikalibr/viewer/viewer_pangolin.cpp
-      )
+    )
+    set(_VIEWER_BACKEND "PANGOLIN")
+    add_compile_definitions(IKALIBR_VIEWER_BACKEND=PANGOLIN)
+    
+    message(STATUS "Visualization: ✓ Pangolin 3D backend (interactive OpenGL)")
+    
+elseif(UNICALIB_WITH_ROS_RVIZ AND UNICALIB_WITH_ROS2)
+    # RViz 次优先级（需要 ROS2）
+    
+    find_package(rclcpp QUIET)
+    find_package(visualization_msgs QUIET)
+    
+    if(rclcpp_FOUND AND visualization_msgs_FOUND)
+        list(APPEND _VIEWER_SOURCES
+            src/viz/ros_rviz_visualizer.cpp
+        )
+        set(_VIEWER_BACKEND "RVIZ")
+        add_compile_definitions(IKALIBR_VIEWER_BACKEND=RVIZ)
+        
+        message(STATUS "Visualization: ✓ ROS RViz backend (via markers)")
+    else()
+        message(WARNING 
+            "ROS2 visualization libraries not found. "
+            "Fall back to headless mode. "
+            "Installation: sudo apt install ros-${ROS_DISTRO}-rclcpp ros-${ROS_DISTRO}-visualization-msgs")
+        
+        list(APPEND _VIEWER_SOURCES
+            src/viz/viewer_stub.cpp
+        )
+        set(_VIEWER_BACKEND "STUB")
+        add_compile_definitions(IKALIBR_VIEWER_BACKEND=STUB)
+        
+        message(STATUS "Visualization: ⚠ Headless mode (no GUI)")
     endif()
-    add_library(unicalib SHARED ${_UNICALIB_SOURCES})
+    
 else()
-    message(STATUS "iKalibr: disabled (lean build — use -DUNICALIB_WITH_IKALIBR=ON to enable B-spline engine)")
+    # 默认：Stub（无 GUI，纯计算）
+    list(APPEND _VIEWER_SOURCES
+        src/viz/viewer_stub.cpp
+    )
+    set(_VIEWER_BACKEND "STUB")
+    add_compile_definitions(IKALIBR_VIEWER_BACKEND=STUB)
+    
+    message(STATUS "Visualization: ⚠ Headless mode (no GUI)")
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────
+# 第 3 层构造：主库源文件列表
+# ─────────────────────────────────────────────────────────────────────────
+
+if(UNICALIB_WITH_IKALIBR)
+    add_compile_definitions(UNICALIB_WITH_IKALIBR=1)
+    
+    # 完整源文件列表 = iKalibr 核心 + 加载器 + UniCalib 新增 + 可视化后端
+    set(_UNICALIB_SOURCES
+        # iKalibr 核心（行 357-479）
+        ${IKALIBR_CORE_SOURCES}
+        # 数据加载器
+        ${IKALIBR_LOADER_SOURCES}
+        # UniCalib 新增（行 492-516）
+        ${UNICALIB_NEW_SOURCES}
+        # 可视化后端（根据选择）
+        ${_VIEWER_SOURCES}
+    )
+    
+    message(STATUS "iKalibr: ✓ Enabled (B-spline solver via basalt-headers)")
+    message(STATUS "  • Spline backend: basalt-headers")
+    message(STATUS "  • Visualization backend: ${_VIEWER_BACKEND}")
+    
+else()
     add_compile_definitions(UNICALIB_WITH_IKALIBR=0)
-    # 仍链接 IMU-LiDAR 所需的最小 iKalibr 实现，避免 undefined reference
-    add_library(unicalib SHARED
+    
+    # 精简源文件列表：仅 UniCalib 模块 + IMU-LiDAR 最小依赖
+    set(_UNICALIB_SOURCES
         ${UNICALIB_NEW_SOURCES}
         ${IKALIBR_MINIMAL_FOR_IMU_LIDAR}
     )
+    
+    message(STATUS "iKalibr: ⚠ Disabled (lean mode)")
+    message(STATUS "  • Use -DUNICALIB_WITH_IKALIBR=ON to enable B-spline solver")
 endif()
 
-# ---------------------------------------------------------------------------
-# 编译选项: IKALIBR_VIEWER_DISABLED (无 Pangolin 时使用 stub，不编 viewer.cpp)
-# ---------------------------------------------------------------------------
-if(UNICALIB_WITH_PANGOLIN)
-  target_compile_definitions(unicalib PUBLIC IKALIBR_VIEWER_DISABLED=0)
-  message(STATUS "iKalibr viewer: Pangolin backend (viewer.cpp + viewer_pangolin.cpp)")
-else()
-  target_compile_definitions(unicalib PUBLIC
-      IKALIBR_VIEWER_DISABLED=TRUE
-      NS_IKALIBR_VIEWER_STUB=1
-  )
-  message(STATUS "iKalibr viewer: stub (no GUI)")
-endif()
+# ─────────────────────────────────────────────────────────────────────────
+# 第 4 步：创建主库目标
+# ─────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Include 路径
-# ---------------------------------------------------------------------------
+add_library(unicalib SHARED ${_UNICALIB_SOURCES})
+
+# ─────────────────────────────────────────────────────────────────────────
+# 第 5 步：链接依赖
+# ─────────────────────────────────────────────────────────────────────────
+
+# 包含目录
 target_include_directories(unicalib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/ikalibr>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/unicalib>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/unicalib/pipeline>
-    # 第三方头文件
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/Sophus>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/magic_enum/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/cereal/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/cereal_eigen_include>
-    # tiny-viewer stubs (ns_viewer:: 骨架类型)
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/tiny-viewer-stub>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ctraj_full/tiny-viewer_stub>
-    # ctraj compat (basalt-headers backend)
-    $<BUILD_INTERFACE:${CTRAJ_BASALT_COMPAT_DIR}>
-    $<BUILD_INTERFACE:${BASALT_HEADERS_DIR}>
-    # veta (veta_impl self-contained headers)
-    $<BUILD_INTERFACE:${VETA_IMPL_DIR}>
-    # PCL
-    ${PCL_INCLUDE_DIRS}
-    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:include>)
+
+# 通用依赖（所有模式）
+target_link_libraries(unicalib PUBLIC
+    Eigen3::Eigen
+    Sophus::Sophus
+    basalt::headers
+    magic_enum::magic_enum
+    cereal::cereal
+    veta::veta
+    tiny_viewer::stub
+    opencv_core
+    opencv_imgproc
+    opencv_highgui
 )
 
-# veta: 使用 veta_impl（自包含头文件库，include 路径由 INTERFACE 自动传递）
-target_link_libraries(unicalib PUBLIC veta_impl)
+# B-样条求解器依赖（仅 IKALIBR 时）
+if(UNICALIB_WITH_IKALIBR)
+    target_link_libraries(unicalib PUBLIC Ceres::ceres)
+endif()
+
+# Pangolin 可视化依赖
+if(UNICALIB_WITH_PANGOLIN AND _VIEWER_BACKEND STREQUAL "PANGOLIN")
+    target_link_libraries(unicalib PUBLIC pangolin)
+endif()
+
+# RViz 可视化依赖
+if(UNICALIB_WITH_ROS_RVIZ AND _VIEWER_BACKEND STREQUAL "RVIZ")
+    target_link_libraries(unicalib PUBLIC
+        rclcpp::rclcpp
+        visualization_msgs::visualization_msgs)
+endif()
+
+# 可选依赖
+if(UNICALIB_WITH_ROS2)
+    target_link_libraries(unicalib PUBLIC
+        rclcpp::rclcpp
+        rosbag2_cpp::rosbag2_cpp)
+endif()
+
+if(UNICALIB_WITH_OPENMP)
+    target_link_libraries(unicalib PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+if(UNICALIB_WITH_PCL_VIZ)
+    target_link_libraries(unicalib PUBLIC pcl_common pcl_io)
+endif()
+
+message(STATUS "unicalib: ✓ Library configured (${_VIEWER_BACKEND} backend)")
+
+# ---------------------------------------------------------------------------
+# 额外 Include 路径（补充上面已有的）
+# ---------------------------------------------------------------------------
+target_include_directories(unicalib PUBLIC
+    # 第三方头文件（补充）
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/unicalib/pipeline>
+    # ctraj compat (basalt-headers backend)
+    $<BUILD_INTERFACE:${CTRAJ_BASALT_COMPAT_DIR}>
+    # PCL
+    ${PCL_INCLUDE_DIRS}
+)
 
 # ufomap: UFO::Map INTERFACE_INCLUDE_DIRECTORIES 自动传递; 额外显式添加保证鲁棒性
 if(ufomap_FOUND)

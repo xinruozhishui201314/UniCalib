@@ -5,6 +5,7 @@
  *   1. IMU-LiDAR 标定可视化 (LiDAR里程计、旋转对、B样条收敛)
  *   2. LiDAR-Camera 投影验证 (边缘对齐、互信息)
  *   3. 通用可视化 (收敛曲线、时间偏移图、误差分布)
+ *   4. Pangolin 3D 可视化（交互式显示）
  */
 
 #include "unicalib/viz/calib_visualizer.h"
@@ -14,6 +15,12 @@
 #include <filesystem>
 #include <algorithm>
 #include <numeric>
+
+#ifdef UNICALIB_WITH_PANGOLIN
+#include <pangolin/pangolin.h>
+#include <pangolin/plot/plotter.h>
+#include <pangolin/gl/gldraw.h>
+#endif  // UNICALIB_WITH_PANGOLIN
 
 namespace fs = std::filesystem;
 
@@ -164,7 +171,121 @@ void CalibVisualizer::show_lidar_odometry(const std::vector<Sophus::SE3d>& poses
 }
 
 void CalibVisualizer::show_bspline_optimization(const std::vector<IMULiDARVizData::OptimizationLog>& history, bool show_animation) {
-    if (!cloud_viewer_ || history.empty()) return;
+#ifdef UNICALIB_WITH_PANGOLIN
+    if (history.empty()) return;
+
+    try {
+        // ───────────────────────────────────────────────────────────
+        // 创建 Pangolin 窗口
+        // ───────────────────────────────────────────────────────────
+        std::string window_name = "UniCalib - B-spline Optimization";
+        pangolin::CreateWindowAndBind(window_name, 1400, 900);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // 3D 视图配置
+        pangolin::OpenGlRenderState s_cam(
+            pangolin::ProjectionMatrix(1400, 600, 500, 500, 700, 300, 0.1, 1000),
+            pangolin::ModelViewLookAt(0, -5, -3, 0, 0, 0, pangolin::AxisZ));
+        
+        pangolin::View& d_cam = pangolin::CreateDisplay()
+            .SetBounds(0.0, 1.0, 0.0, 0.65)
+            .SetHandler(new pangolin::Handler3D(s_cam));
+
+        // 图表窗口
+        pangolin::View& d_plot = pangolin::CreateDisplay()
+            .SetBounds(0.0, 1.0, 0.65, 1.0);
+
+        // ───────────────────────────────────────────────────────────
+        // 渲染循环
+        // ───────────────────────────────────────────────────────────
+        while (!pangolin::ShouldQuit()) {
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            // 3D 场景
+            d_cam.Activate(s_cam);
+            glEnable(GL_DEPTH_TEST);
+            glColorMask(true, true, true, true);
+
+            // 绘制坐标系
+            pangolin::glDrawCoordinateFrame(1.0);
+
+            // 可视化轨迹点（如果有可用的位姿信息）
+            glPointSize(2.0f);
+            glBegin(GL_POINTS);
+            glColor3f(0, 1, 0);  // 绿色
+            for (const auto& log : history) {
+                // 这里可扩展显示轨迹
+            }
+            glEnd();
+
+            // 收敛曲线窗口
+            d_plot.Activate();
+            
+            // 提取优化数据
+            std::vector<double> iterations;
+            std::vector<double> costs;
+            
+            for (size_t i = 0; i < history.size(); ++i) {
+                iterations.push_back(static_cast<double>(i));
+                costs.push_back(history[i].cost);
+            }
+
+            // 绘制收敛曲线
+            if (!costs.empty()) {
+                double max_cost = *std::max_element(costs.begin(), costs.end());
+                double min_cost = *std::min_element(costs.begin(), costs.end());
+                
+                glClear(GL_COLOR_BUFFER_BIT);
+                glMatrixMode(GL_PROJECTION);
+                glPushMatrix();
+                glLoadIdentity();
+                glOrtho(0, iterations.size(), min_cost * 0.9, max_cost * 1.1, -1, 1);
+                glMatrixMode(GL_MODELVIEW);
+                glPushMatrix();
+                glLoadIdentity();
+
+                // 绘制网格
+                glColor3f(0.3f, 0.3f, 0.3f);
+                glBegin(GL_LINES);
+                for (int i = 0; i <= 10; ++i) {
+                    double y = min_cost + (max_cost - min_cost) * i / 10.0;
+                    glVertex2f(0, y);
+                    glVertex2f(iterations.size(), y);
+                }
+                glEnd();
+
+                // 绘制曲线
+                glColor3f(1, 0, 0);
+                glLineWidth(2.0f);
+                glBegin(GL_LINE_STRIP);
+                for (size_t i = 0; i < costs.size(); ++i) {
+                    glVertex2f(i, costs[i]);
+                }
+                glEnd();
+
+                // 恢复投影
+                glPopMatrix();
+                glMatrixMode(GL_PROJECTION);
+                glPopMatrix();
+                glMatrixMode(GL_MODELVIEW);
+            }
+
+            pangolin::FinishFrame();
+
+            if (!show_animation) break;
+        }
+
+        UNICALIB_INFO("[CalibVisualizer] B-spline optimization visualization completed");
+
+    } catch (const std::exception& e) {
+        UNICALIB_ERROR("[CalibVisualizer] Pangolin visualization error: {}", e.what());
+    }
+
+#else
+    // 无 Pangolin 时，输出到文件
+    UNICALIB_WARN("[CalibVisualizer] Pangolin not available, using OpenCV visualization");
+    
+    if (cloud_viewer_ || history.empty()) return;
 
     // 提取收敛数据
     std::vector<double> iterations;
@@ -179,7 +300,7 @@ void CalibVisualizer::show_bspline_optimization(const std::vector<IMULiDARVizDat
         }
     }
 
-    // 绘制收敛曲线
+    // 绘制收敛曲线（OpenCV 版本）
     cv::Mat conv_curve = draw_optimization_convergence_curve(iterations, costs, "B-spline Optimization",
                                                               config_.plot_width, config_.plot_height);
     save_plots(config_.screenshot_dir + "/bspline_convergence");
@@ -193,6 +314,8 @@ void CalibVisualizer::show_bspline_optimization(const std::vector<IMULiDARVizDat
     if (show_animation && cloud_viewer_) {
         cloud_viewer_->spin_once(100);
     }
+
+#endif  // UNICALIB_WITH_PANGOLIN
 }
 
 // ===========================================================================
