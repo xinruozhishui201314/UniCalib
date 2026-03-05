@@ -456,6 +456,7 @@ set(UNICALIB_NEW_SOURCES
     # 可视化 (PCL + OpenCV, 替换 tiny-viewer)
     src/viz/cloud_viewer.cpp
     src/viz/report_gen.cpp
+    src/viz/calib_visualizer.cpp
     # I/O
     src/io/yaml_io.cpp
 )

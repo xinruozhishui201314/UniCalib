@@ -81,6 +81,12 @@ public:
         double ba_min_track_len = 3;    // 最短特征轨迹长度
         bool   ba_optimize_intrinsics = false;
 
+        // 尺度约束 (参考: "Solving for Relative Pose with Constraints", CVPR 2014)
+        // 通过已知距离 (如棋盘格尺寸) 消除尺度不确定性
+        bool   enable_scale_constraint = false;    // 启用尺度约束
+        double known_baseline_scale = 1.0;         // 已知尺度 (例如棋盘格宽度) [m]
+        double scale_constraint_weight = 100.0;    // 尺度约束权重 (Ceres 优化)
+
         // 通用
         double max_rms_px = 2.0;
         bool   verbose = true;

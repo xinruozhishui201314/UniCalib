@@ -172,6 +172,24 @@ public:
     // 获取当前标定参数 (可在标定过程中查询)
     CalibParamManager::Ptr get_params() const { return params_; }
 
+#ifdef UNICALIB_WITH_IKALIBR
+    // Phase3 辅助: iKalibr 参数回写
+    // 用于将 iKalibr 优化结果写回 params_
+    struct iKalibrResultWriter {
+        void write_extrinsics(
+            const ns_ikalibr::CalibParamManager::Ptr& ikalibr_param_mgr,
+            CalibParamManager::Ptr& unicalib_params);
+        
+        void write_imu_intrinsics(
+            const ns_ikalibr::CalibParamManager::Ptr& ikalibr_param_mgr,
+            CalibParamManager::Ptr& unicalib_params);
+        
+        void write_camera_intrinsics(
+            const ns_ikalibr::CalibParamManager::Ptr& ikalibr_param_mgr,
+            CalibParamManager::Ptr& unicalib_params);
+    };
+#endif  // UNICALIB_WITH_IKALIBR
+
 private:
     Config cfg_;
     SystemConfig sys_cfg_;

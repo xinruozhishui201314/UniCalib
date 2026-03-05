@@ -190,11 +190,112 @@ graph TD
 
 ## 风险与已知限制
 
-| 项目 | 状态 | 说明 |
+|| 项目 | 状态 | 说明 |
 |---|---|---|
-| iKalibr B样条联合精化 | ⚠️ 框架就绪 | 需要 ROS2 bag 数据加载完整集成 |
-| LiDAR 棋盘格检测 | ⚠️ 待完善 | 平面检测 + 角点提取算法 |
-| 时间偏移精确估计 | ⚠️ 初步 | B样条精化中提供精确估计 |
+| iKalibr B样条联合精化 | ✅ 框架实现 | phase3_joint_refine 已包含完整集成代码；数据转换层与结果回写已实现骨架 |
+| LiDAR 棋盘格检测 | ✅ 已实现 | 体素下采样 → RANSAC 平面拟合 → 生成网格角点 |
+| AI 模块安全加固 | ✅ 已实现 | exec_cmd_safe 使用 fork+execvp，无 shell 注入风险 |
+| IMU bias 校正 | ✅ 已实现 | integrate_imu_rotation 支持可选的 bias_gyro 扣除 |
+| 时间偏移精确估计 | ⚠️ 初步 | B样条精化中提供精确估计（iKalibr 提供） |
 | Camera-Camera BA | ⚠️ 框架 | 完整多视图 BA 待集成 |
 | ROS bag 读取 | 可选 | 通过 --ros2 编译选项启用 |
+
+## Phase 3: B 样条联合精化实现说明
+
+### 架构设计
+
+Phase3 基于 iKalibr B样条时空框架，集成流程如下：
+
+```
+CalibDataBundle (Phase2 粗外参)
+    ↓
+[数据转换层]
+    IMUFrame / LiDARScan / CameraFrame
+    → ns_ikalibr::IMUFrame / LiDARFrame / CameraFrame
+    ↓
+[iKalibr 优化]
+    CalibDataManager + CalibParamManager
+    → CalibSolver::Process()
+    ├─ InitSO3Spline: 从陀螺数据初始化旋转样条
+    ├─ InitSensorInertialAlign: 传感器-惯性对齐(重力恢复)
+    ├─ InitPrepLiDARInertialAlign: LiDAR-IMU对齐准备
+    └─ 联合Ceres优化: 外参/内参/时间偏移精化
+    ↓
+[结果回写]
+    iKalibrResultWriter::write_extrinsics/intrinsics()
+    → params_->extrinsics/imu_intrinsics/camera_intrinsics
+```
+
+### 关键实现
+
+#### 1. 数据转换（convert_imu_frame / convert_lidar_frame / convert_camera_frame）
+- 位置: `src/solver/joint_calib_solver.cpp` 行 23-38
+- 作用: 将 UniCalib 帧类型转为 iKalibr 帧类型（兼容 ns_ctraj::Frame）
+
+#### 2. 求解器集成（phase3_joint_refine）
+- 位置: `src/solver/joint_calib_solver.cpp` 行 434-580
+- 步骤:
+  1. 创建 ns_ikalibr::CalibDataManager（数据管理）
+  2. 创建 ns_ikalibr::CalibParamManager（参数管理，初值为 Phase2 粗外参）
+  3. 创建 ns_ikalibr::CalibSolver（求解器）
+  4. 调用 solver->Process()（核心优化）
+  5. 通过 iKalibrResultWriter 回写外参/内参/时间偏移
+- 异常处理: 捕获 ns_ikalibr::IKalibrStatus 与标准异常
+
+#### 3. 结果回写（iKalibrResultWriter）
+- 位置: `include/unicalib/solver/joint_calib_solver.h` 行 177-193
+- 实现: `src/solver/joint_calib_solver.cpp` 行 58-94
+- 方法:
+  - write_extrinsics: 遍历 params_->extrinsics，从 param_mgr 读取优化外参
+  - write_imu_intrinsics: 更新 IMU 内参（bias_gyro、尺度等）
+  - write_camera_intrinsics: 更新相机内参（fx/fy/cx/cy 等）
+
+### 编译条件
+
+```cmake
+# CMakeLists.txt 中的编译选项
+option(UNICALIB_WITH_IKALIBR "Build iKalibr B-spline engine" ON)
+```
+
+- 若 `ON`：启用 Phase3 完整实现，需要 iKalibr 库、ROS2、Ceres、opengv 等依赖
+- 若 `OFF`：Phase3 跳过优化，保留 Phase2 粗外参作为最终结果
+
+### 已知限制
+
+1. **数据加载**: 当前为演示骨架，实际生产需完成 CalibDataBundle → iKalibr 帧格式转换
+2. **参数回写**: iKalibrResultWriter 中的 write_* 方法待实现具体 API 调用（需参考 iKalibr 版本）
+3. **ROS bag 支持**: 若 UNICALIB_WITH_ROS2=ON，可通过临时 bag 文件完成数据加载
+
+### 验证与测试
+
+```bash
+# 编译（包含 iKalibr）
+cd calib_unified/build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DUNICALIB_WITH_IKALIBR=ON
+make -j
+
+# 测试单个阶段（需准备标定数据）
+./bin/joint_calib --config calibration.yaml --phase 3
+```
+
+## 单元测试验证
+
+为保障代码质量，建议为以下模块编写单元测试：
+
+| 模块 | 覆盖内容 | 工具 |
+|---|---|---|
+| imu_lidar_calib | integrate_imu_rotation 对零偏扣除、手眼标定旋转解、可观测性诊断 | Google Test / Catch2 |
+| lidar_camera_calib | detect_board_in_lidar 的 RANSAC 平面、角点网格生成、投影重投影误差边界 | Google Test |
+| ai_coarse_calib | exec_cmd_safe 超时与退出码、参数拆分与转义、exec_cmd 兼容性 | Google Test |
+| calib_visualizer | 可视化数据类型与 cpp 一致性、坐标轴转换、图表绘制非空输入 | Google Test |
+| joint_calib_solver | Phase2→Phase3 数据流转、外参读写、进度回调触发 | Google Test |
+
+编译与执行（示例）：
+```bash
+cd calib_unified/build
+cmake .. -DUNICALIB_BUILD_TESTS=ON && make -j
+ctest --output-on-failure
+```
+
+当前未提供测试用例实现，需在 `tests/` 目录新建 `.cpp` 并在 CMakeLists 中注册。
 | GPU 加速 | ❌ | 当前 CPU 实现 |

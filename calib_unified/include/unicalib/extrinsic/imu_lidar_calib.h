@@ -205,9 +205,10 @@ private:
     // Step 1: 运行 LiDAR 里程计
     bool run_lidar_odometry(const std::vector<LiDARScan>& scans);
 
-    // Step 2: 构建旋转对
+    // Step 2: 构建旋转对 (imu_intrin 可选，用于积分时扣除陀螺零偏)
     std::vector<LiDARRotPair> build_rotation_pairs(
-        const std::vector<IMUFrame>& imu_data);
+        const std::vector<IMUFrame>& imu_data,
+        const IMUIntrinsics* imu_intrin = nullptr);
 
     // Step 3: 手眼旋转标定 (QEF / Daniilidis)
     std::optional<Sophus::SO3d> solve_handeye_rotation(
@@ -228,11 +229,12 @@ private:
         const std::string& lidar_id,
         const IMUIntrinsics* imu_intrin);
 
-    // Step 辅助: IMU 旋转积分
+    // Step 辅助: IMU 旋转积分 (imu_intrin 非空时扣除 bias_gyro)
     Sophus::SO3d integrate_imu_rotation(
         const std::vector<IMUFrame>& imu_data,
         double t_begin,
-        double t_end);
+        double t_end,
+        const IMUIntrinsics* imu_intrin = nullptr);
 };
 
 }  // namespace ns_unicalib

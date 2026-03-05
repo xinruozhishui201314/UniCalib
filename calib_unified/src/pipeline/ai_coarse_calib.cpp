@@ -13,6 +13,7 @@
  */
 
 #include "unicalib/pipeline/ai_coarse_calib.h"
+#include "unicalib/common/logger.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -20,7 +21,12 @@
 #include <cstdio>
 #include <chrono>
 #include <stdexcept>
+#include <thread>
 #include <yaml-cpp/yaml.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <fcntl.h>
 
 namespace fs = std::filesystem;
 
@@ -35,30 +41,74 @@ struct ExecResult {
     double elapsed_ms;
 };
 
-static ExecResult exec_cmd(const std::string& cmd, int timeout_sec) {
+// 安全执行: 无 shell，参数列表直接传 execvp，避免命令注入
+static ExecResult exec_cmd_safe(std::vector<std::string> argv, int timeout_sec) {
     ExecResult r{};
-    auto t0 = std::chrono::steady_clock::now();
-
-    std::string full_cmd = "timeout " + std::to_string(timeout_sec) + " " + cmd + " 2>&1";
-    UNICALIB_DEBUG("[AI-Exec] 命令: {}", full_cmd);
-
-    FILE* pipe = popen(full_cmd.c_str(), "r");
-    if (!pipe) {
+    if (argv.empty()) {
         r.exit_code = -1;
-        r.stdout_str = "popen failed";
+        r.stdout_str = "exec_cmd_safe: argv empty";
         return r;
     }
+    auto t0 = std::chrono::steady_clock::now();
 
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
-        r.stdout_str += buf;
+    int pipe_fd[2];
+    if (pipe(pipe_fd) != 0) {
+        r.exit_code = -1;
+        r.stdout_str = "pipe() failed";
+        return r;
     }
-    r.exit_code = pclose(pipe);
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        r.exit_code = -1;
+        r.stdout_str = "fork() failed";
+        return r;
+    }
+    if (pid == 0) {
+        close(pipe_fd[0]);
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        dup2(pipe_fd[1], STDERR_FILENO);
+        close(pipe_fd[1]);
+        std::vector<char*> ptrs;
+        for (auto& s : argv) ptrs.push_back(const_cast<char*>(s.c_str()));
+        ptrs.push_back(nullptr);
+        execvp(argv[0].c_str(), ptrs.data());
+        _exit(127);
+    }
+    close(pipe_fd[1]);
+    std::thread timeout_thread([pid, timeout_sec]() {
+        std::this_thread::sleep_for(std::chrono::seconds(timeout_sec));
+        kill(pid, SIGKILL);
+    });
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(pipe_fd[0], buf, sizeof(buf))) > 0)
+        r.stdout_str.append(buf, static_cast<size_t>(n));
+    close(pipe_fd[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    timeout_thread.join();
+    r.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : (WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1);
     auto t1 = std::chrono::steady_clock::now();
-    r.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count();
-
+    r.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     UNICALIB_DEBUG("[AI-Exec] 退出码={} 耗时={:.0f}ms", r.exit_code, r.elapsed_ms);
     return r;
+}
+
+static ExecResult exec_cmd(const std::string& cmd, int timeout_sec) {
+    // 兼容旧调用: 将单字符串拆成 argv (仅空格分隔，路径含空格会失败)
+    std::vector<std::string> argv;
+    std::istringstream iss(cmd);
+    std::string tok;
+    while (iss >> tok) argv.push_back(tok);
+    if (argv.empty()) {
+        ExecResult r;
+        r.exit_code = -1;
+        r.stdout_str = "exec_cmd: empty command";
+        return r;
+    }
+    return exec_cmd_safe(std::move(argv), timeout_sec);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +626,7 @@ L2CalibResult L2CalibAdapter::estimate_from_bag(
             << " --alg " << cfg_.alg
             << " --SO3-distribution " << cfg_.so3_dist
             << " --num-epochs " << cfg_.num_epochs
-            << " --min -" << cfg_.rough_trans_m
+            << " --min " << (-cfg_.rough_trans_m)
             << " --max " << cfg_.rough_trans_m
             << " --output_dir " << output_dir;
 
@@ -604,6 +654,68 @@ L2CalibResult L2CalibAdapter::estimate_from_bag(
         } else {
             result.error_msg = "未找到输出: " + out_yaml;
             UNICALIB_WARN("[L2Calib] {}", result.error_msg);
+        }
+    } catch (const std::exception& e) {
+        result.error_msg = std::string("L2Calib 异常: ") + e.what();
+        UNICALIB_ERROR("[L2Calib] {}", result.error_msg);
+    }
+    return result;
+}
+
+L2CalibResult L2CalibAdapter::estimate_from_trajectories(
+    const std::string& lidar_traj_path,
+    const std::string& imu_traj_path,
+    const std::string& output_dir_arg) const {
+
+    L2CalibResult result;
+    result.model_name = "L2Calib";
+
+    if (!is_available()) {
+        result.error_msg = "L2Calib 不可用";
+        UNICALIB_WARN("[L2Calib] {}", result.error_msg);
+        return result;
+    }
+
+    if (!fs::exists(lidar_traj_path) || !fs::exists(imu_traj_path)) {
+        result.error_msg = "轨迹文件不存在: " + lidar_traj_path + " / " + imu_traj_path;
+        UNICALIB_WARN("[L2Calib] {}", result.error_msg);
+        return result;
+    }
+
+    try {
+        fs::create_directories(cfg_.work_dir);
+        std::string output_dir = output_dir_arg.empty() ?
+            cfg_.work_dir + "/output" : output_dir_arg;
+        fs::create_directories(output_dir);
+
+        std::ostringstream cmd;
+        cmd << "cd " << cfg_.repo_dir << " && "
+            << "export PYTHONPATH=" << cfg_.repo_dir << "/rl_solver:$PYTHONPATH && "
+            << cfg_.python_exe << " " << cfg_.train_script
+            << " --lidar-traj " << lidar_traj_path
+            << " --imu-traj " << imu_traj_path
+            << " --alg " << cfg_.alg
+            << " --SO3-distribution " << cfg_.so3_dist
+            << " --num-epochs " << cfg_.num_epochs
+            << " --output_dir " << output_dir;
+
+        auto exec_r = exec_cmd(cmd.str(), cfg_.timeout_sec);
+        result.elapsed_ms = exec_r.elapsed_ms;
+        result.num_epochs = cfg_.num_epochs;
+
+        if (exec_r.exit_code != 0) {
+            result.error_msg = "L2Calib (轨迹模式) 失败 exit=" + std::to_string(exec_r.exit_code);
+            UNICALIB_WARN("[L2Calib] {}", result.error_msg);
+            return result;
+        }
+
+        std::string out_yaml = output_dir + "/calibration_result.yaml";
+        if (fs::exists(out_yaml)) {
+            result.coarse_extrin = parse_output(out_yaml);
+            result.success    = true;
+            result.confidence = 0.65;
+        } else {
+            result.error_msg = "未找到输出: " + out_yaml;
         }
     } catch (const std::exception& e) {
         result.error_msg = std::string("L2Calib 异常: ") + e.what();

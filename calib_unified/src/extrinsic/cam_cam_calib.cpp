@@ -418,6 +418,39 @@ ExtrinsicSE3 CamCamCalibrator::bundle_adjustment_two_views(
         opt.max_num_iterations = cfg_.ba_max_iter;
         opt.linear_solver_type = ceres::DENSE_SCHUR;
         opt.minimizer_progress_to_stdout = false;
+        
+        // 添加尺度约束 (参考: "Solving for Relative Pose with Constraints", CVPR 2014)
+        // 通过已知距离消除尺度不确定性
+        // 约束: ||t|| = known_baseline_scale (已知的基线长度)
+        if (cfg_.enable_scale_constraint && cfg_.known_baseline_scale > 0.001) {
+            // 尺度约束代价函数: (||t|| - scale_target)^2 * weight
+            struct ScaleConstraintCost {
+                double target_scale, weight;
+                ScaleConstraintCost(double s, double w) : target_scale(s), weight(w) {}
+                
+                template <typename T>
+                bool operator()(const T* const pose, T* residual) const {
+                    // 平移向量: pose[3], pose[4], pose[5]
+                    T tx = pose[3], ty = pose[4], tz = pose[5];
+                    T translation_norm = ceres::sqrt(tx*tx + ty*ty + tz*tz);
+                    residual[0] = T(weight) * (translation_norm - T(target_scale));
+                    return true;
+                }
+                
+                static ceres::CostFunction* Create(double target_scale, double weight) {
+                    return new ceres::AutoDiffCostFunction<ScaleConstraintCost, 1, 6>(
+                        new ScaleConstraintCost(target_scale, weight));
+                }
+            };
+            
+            problem.AddResidualBlock(
+                ScaleConstraintCost::Create(cfg_.known_baseline_scale, cfg_.scale_constraint_weight),
+                nullptr, pose);
+            
+            UNICALIB_INFO("  BA: 启用尺度约束 scale={:.4f}m weight={:.1f}",
+                         cfg_.known_baseline_scale, cfg_.scale_constraint_weight);
+        }
+        
         ceres::Solver::Summary summary;
         ceres::Solve(opt, &problem, &summary);
         UNICALIB_INFO("  BA: n_valid={} {}", n_valid, summary.BriefReport());

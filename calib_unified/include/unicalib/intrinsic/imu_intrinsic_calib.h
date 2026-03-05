@@ -87,6 +87,15 @@ public:
         double static_accel_var_threshold = 0.1;  // m/s^2 方差阈值
         int    min_static_frames     = 50;      // 最少静态帧数
 
+        // MAP_COEFF 可选优化
+        // 参考: iKalibr estimator_tpl.hpp, OPT_GYRO_MAP_COEFF / OPT_ACCE_MAP_COEFF
+        // MAP_COEFF: [v1, v2, v3, v4, v5, v6]^T 代表传感器的比例因子矩阵
+        //   M = [v1   v4   v5]  (上三角矩阵参数化)
+        //       [0    v2   v6]
+        //       [0    0    v3]
+        bool   optimize_gyro_map_coeff = false;   // 陀螺仪比例因子矩阵优化
+        bool   optimize_accel_map_coeff = false;  // 加速度计比例因子矩阵优化
+
         // 输出
         bool   verbose = true;
     };
