@@ -72,7 +72,7 @@ static void print_help() {
         "日志/输出:\n"
         "  --log-level <l>        trace|debug|info|warn|error\n"
         "  --output-dir <dir>     输出目录 (默认 ./calib_output)\n\n"
-        "配置文件示例: config/joint_example.yaml\n\n";
+        "配置文件: config/unicalib_example.yaml（全工程唯一）\n\n";
 }
 
 // 打印任务选择摘要

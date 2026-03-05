@@ -1,0 +1,169 @@
+# =============================================================================
+# UniCalib 统一配置 — 全工程唯一配置文件
+# =============================================================================
+#
+# 所有标定任务均使用本文件，通过脚本指定 --task 选择任务类型：
+#   imu-intrin   cam-intrin   imu-lidar   lidar-cam   cam-cam   joint
+#
+# 用法示例：
+#   ./calib_unified_run.sh --run --task imu-intrin
+#   ./calib_unified_run.sh --run --task lidar-cam --config calib_unified/config/unicalib_example.yaml
+#   ./calib_unified_run.sh --run --task lidar-cam --dataset nya_02_ros2
+#   ./calib_unified_run.sh --run --task joint --data-dir /path/to/my_data
+#
+# 数据路径说明：
+#   - 脚本会将 宿主机数据目录 挂载到容器内 CALIB_DATA_DIR（默认 $PROJECT/data）。
+#   - 可使用 --data-dir <绝对路径> 指定数据根目录；
+#   - 可使用 --dataset <子目录名> 指定数据集（如 nya_02_ros2），等价于数据目录为 $CALIB_DATA_DIR/nya_02_ros2。
+#   - 本文件中 data 下路径可为绝对路径，或相对容器内 CALIB_DATA_DIR 的相对路径（若程序支持）。
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 任务开关 (仅 unicalib_joint 联合标定时生效；单任务由命令行 --task 决定)
+# ---------------------------------------------------------------------------
+do_imu_intrinsic:           true   # 是否执行 IMU 内参标定 (Allan + 六面法)
+do_camera_intrinsic:        true   # 是否执行相机内参标定 (棋盘格)
+do_imu_lidar_extrinsic:     true   # 是否执行 IMU-LiDAR 外参标定
+do_lidar_camera_extrinsic:  true   # 是否执行 LiDAR-Camera 外参标定
+do_cam_cam_extrinsic:       false  # 是否执行 Camera-Camera 外参标定 (单目可关)
+do_joint_bspline_refine:    true   # 是否进行 iKalibr B 样条联合精化
+
+verbose: true
+
+# ---------------------------------------------------------------------------
+# 输出目录
+# 所有任务的结果均可写入此目录（或各 app 在其下建子目录）
+# ---------------------------------------------------------------------------
+output_dir: ./calib_output/joint
+
+# ---------------------------------------------------------------------------
+# 传感器系统配置
+# 定义参与标定的传感器 id、类型、ROS topic 及各自参数，供联合标定与单任务读取
+# ---------------------------------------------------------------------------
+sensors:
+  # IMU：用于内参标定及作为外参参考系 (reference_imu)
+  - id: imu_0
+    type: imu
+    topic: /imu/data             # 使用 bag 时的 ROS topic
+    imu:
+      rate_hz: 200.0
+      model: scale_misalignment  # bias_only | scale_only | scale_misalignment
+
+  # LiDAR：用于 IMU-LiDAR、LiDAR-Camera 外参
+  - id: lidar_front
+    type: lidar
+    topic: /velodyne_points
+    lidar:
+      type: spinning             # spinning | solid_state
+      scan_lines: 32
+      rate_hz: 10.0
+
+  # 相机：用于内参、LiDAR-Camera、Camera-Camera 外参
+  - id: cam_left
+    type: camera
+    topic: /cam_left/image_raw
+    camera:
+      model: pinhole             # pinhole | fisheye
+      width: 1280
+      height: 720
+      fps: 30.0
+      rolling_shutter: false
+
+  # 多目时取消注释，用于 Camera-Camera 外参
+  # - id: cam_right
+  #   type: camera
+  #   topic: /cam_right/image_raw
+
+# 外参参考系：所有外参均相对此 IMU 坐标系
+reference_imu: imu_0
+
+# ---------------------------------------------------------------------------
+# 数据路径
+# 使用 --data-dir 或 --dataset 时，容器内 CALIB_DATA_DIR 会指向对应目录，
+# 此处可填相对该目录的路径（如 imu.csv、images/）或绝对路径。
+# 示例：--dataset nya_02_ros2 时，可将 imu_0 设为 imu.csv（即 CALIB_DATA_DIR/imu.csv）
+# ---------------------------------------------------------------------------
+data:
+  # ROS2 bag：若用 bag 驱动，填 bag 路径（相对 CALIB_DATA_DIR 或绝对路径）
+  bag_file: /path/to/calibration_data.bag
+
+  # IMU 数据：每个 sensor id 对应一个 CSV 或目录
+  # CSV 格式: timestamp[s], gx[rad/s], gy[rad/s], gz[rad/s], ax[m/s²], ay[m/s²], az[m/s²]
+  imu:
+    imu_0: /path/to/imu_data/imu.csv
+
+  # LiDAR：每个 lidar id 对应点云目录或 bag 内 topic
+  lidar:
+    lidar_front: /path/to/lidar_scans/
+
+  # 相机：每个 camera id 下可指定 images_dir 或 intrinsic_yaml（内参已知时）
+  camera:
+    cam_left:
+      images_dir: /path/to/cam_left/images/
+      # intrinsic_yaml: /path/to/cam_left_intrinsic.yaml  # 有内参时可跳过内参标定
+
+# ---------------------------------------------------------------------------
+# IMU 内参标定参数
+# 被 unicalib_imu_intrinsic 与 unicalib_joint 使用
+# ---------------------------------------------------------------------------
+imu_intrinsic:
+  static_gyro_thresh: 0.05    # 静态段判断：陀螺幅值阈值 (rad/s)
+  static_detect_window: 0.5   # 静态检测滑动窗口时长 (s)
+  min_static_frames: 50       # 最少连续静态帧数
+  allan_num_tau_points: 50   # Allan 方差曲线 τ 点数
+
+# ---------------------------------------------------------------------------
+# 相机内参标定参数
+# 被 unicalib_camera_intrinsic 与 unicalib_joint 使用
+# ---------------------------------------------------------------------------
+camera_intrinsic:
+  min_images: 15              # 最少参与标定的图像数
+  max_images: 100             # 最多使用图像数
+  max_rms_px: 1.5             # 重投影误差上限 (像素)，超过则报警
+  target:
+    type: chessboard          # 标定板类型: chessboard | circles | asym_circles
+    cols: 9                   # 内角点列数
+    rows: 6                   # 内角点行数
+    square_size: 0.025        # 格子边长 (m)
+  model: pinhole              # 相机模型: pinhole | fisheye
+
+# ---------------------------------------------------------------------------
+# IMU-LiDAR 外参标定参数
+# ---------------------------------------------------------------------------
+imu_lidar:
+  ndt_resolution: 1.0        # NDT 体素分辨率 (m)
+  ndt_max_iter: 30
+  spline_dt_s: 0.1           # B 样条结间隔 (s)
+  spline_order: 4            # 样条阶数 (4=三次)
+  optimize_time_offset: true # 是否优化时间偏移
+  time_offset_init: 0.0      # 时间偏移初值 (s)
+  time_offset_max: 0.2       # 时间偏移优化范围 (s)
+  min_motion_rot_deg: 3.0    # 最小有效旋转量 (度)，用于筛选激励不足的片段
+
+# ---------------------------------------------------------------------------
+# LiDAR-Camera 外参标定参数
+# ---------------------------------------------------------------------------
+lidar_camera:
+  method: target              # target | edge | motion
+  board_cols: 9               # 标定板列数 (method=target 时)
+  board_rows: 6
+  square_size: 0.025
+  optimize_time_offset: true
+
+# ---------------------------------------------------------------------------
+# Camera-Camera 外参标定参数 (多目)
+# ---------------------------------------------------------------------------
+cam_cam:
+  method: chessboard          # chessboard | essential | ba
+  fix_intrinsics: true        # 是否固定已标定内参
+  max_rms_px: 2.0
+
+# ---------------------------------------------------------------------------
+# 联合 B 样条优化 (iKalibr)，联合标定时使用
+# ---------------------------------------------------------------------------
+joint_bspline:
+  spline_order: 4
+  spline_dt_s: 0.05
+  max_iterations: 50
+  optimize_gravity: true
+  optimize_intrinsics: false  # 是否在联合优化中同时优化内参

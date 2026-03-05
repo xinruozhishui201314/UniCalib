@@ -43,16 +43,37 @@ AppConfig parse_config(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
-            // 从 YAML 文件加载
+            // 从 YAML 文件加载（支持统一配置 unicalib_example.yaml 或独立 IMU 配置）
             YAML::Node node = YAML::LoadFile(argv[++i]);
-            if (node["sensor_id"])  cfg.sensor_id  = node["sensor_id"].as<std::string>();
-            if (node["data_file"])  cfg.data_file  = node["data_file"].as<std::string>();
-            if (node["data_dir"])   cfg.data_dir   = node["data_dir"].as<std::string>();
-            if (node["output_dir"]) cfg.output_dir = node["output_dir"].as<std::string>();
-            if (node["calib"]) {
-                auto cc = node["calib"];
-                if (cc["static_gyro_thresh"]) cfg.calib_cfg.static_gyro_threshold = cc["static_gyro_thresh"].as<double>();
-                if (cc["min_static_frames"])  cfg.calib_cfg.min_static_frames = cc["min_static_frames"].as<int>();
+            // 统一配置: data + sensors，取第一个 IMU
+            if (node["data"] && node["sensors"]) {
+                for (const auto& s : node["sensors"]) {
+                    if (s["type"] && s["type"].as<std::string>() == "imu") {
+                        cfg.sensor_id = s["id"].as<std::string>();
+                        if (node["data"]["imu"] && node["data"]["imu"][cfg.sensor_id]) {
+                            cfg.data_file = node["data"]["imu"][cfg.sensor_id].as<std::string>();
+                        }
+                        break;
+                    }
+                }
+                if (node["output_dir"]) cfg.output_dir = node["output_dir"].as<std::string>();
+                if (node["imu_intrinsic"]) {
+                    const auto& ii = node["imu_intrinsic"];
+                    if (ii["static_gyro_thresh"])   cfg.calib_cfg.static_gyro_threshold = ii["static_gyro_thresh"].as<double>();
+                    if (ii["static_detect_window"]) cfg.calib_cfg.static_detect_window    = ii["static_detect_window"].as<double>();
+                    if (ii["min_static_frames"])   cfg.calib_cfg.min_static_frames      = ii["min_static_frames"].as<int>();
+                }
+            } else {
+                if (node["sensor_id"])  cfg.sensor_id  = node["sensor_id"].as<std::string>();
+                if (node["data_file"])  cfg.data_file  = node["data_file"].as<std::string>();
+                if (node["data_dir"])   cfg.data_dir   = node["data_dir"].as<std::string>();
+                if (node["output_dir"]) cfg.output_dir = node["output_dir"].as<std::string>();
+                if (node["calib"]) {
+                    auto cc = node["calib"];
+                    if (cc["static_gyro_thresh"]) cfg.calib_cfg.static_gyro_threshold = cc["static_gyro_thresh"].as<double>();
+                    if (cc["static_detect_window"]) cfg.calib_cfg.static_detect_window = cc["static_detect_window"].as<double>();
+                    if (cc["min_static_frames"])  cfg.calib_cfg.min_static_frames = cc["min_static_frames"].as<int>();
+                }
             }
         } else if (arg == "--sensor_id" && i + 1 < argc) {
             cfg.sensor_id = argv[++i];

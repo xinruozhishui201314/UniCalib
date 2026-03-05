@@ -19,10 +19,8 @@
 calib_unified/
 ├── CMakeLists.txt          # 主构建配置
 ├── build.sh                # 一键编译脚本
-├── config/                 # 配置示例文件
-│   ├── joint_example.yaml
-│   ├── imu_intrinsic_example.yaml
-│   └── camera_intrinsic_example.yaml
+├── config/                 # 配置（全工程唯一）
+│   └── unicalib_example.yaml   # 所有标定任务共用
 ├── include/
 │   ├── unicalib/           # 新统一接口头文件
 │   │   ├── common/         # 数据结构、日志、参数管理
@@ -75,7 +73,43 @@ calib_unified/
 
 **推荐: 在 Docker 容器中编译** (docker/Dockerfile 已包含所有依赖)
 
-## 快速开始
+## 一键脚本 (推荐)
+
+项目根目录提供 **calib_unified_run.sh**，完成编译、验证与标定运行，**全工程仅使用一份配置** `config/unicalib_example.yaml`：
+
+```bash
+# 在项目根目录执行
+cd /path/to/UniCalib
+
+# 编译 + 自动化验证
+./calib_unified_run.sh
+
+# 按任务运行（均使用 calib_unified/config/unicalib_example.yaml）
+./calib_unified_run.sh --run --task imu-intrin    # IMU 内参
+./calib_unified_run.sh --run --task cam-intrin    # 相机内参
+./calib_unified_run.sh --run --task imu-lidar     # IMU-雷达外参
+./calib_unified_run.sh --run --task lidar-cam     # 雷达-相机外参
+./calib_unified_run.sh --run --task cam-cam       # 相机-相机外参
+./calib_unified_run.sh --run --task joint         # 联合标定
+
+# 指定数据路径：--data-dir 或 --dataset（如使用 nya_02_ros2 数据集）
+./calib_unified_run.sh --run --task lidar-cam --config calib_unified/config/unicalib_example.yaml --dataset nya_02_ros2
+./calib_unified_run.sh --run --task lidar-cam --data-dir /path/to/data --dataset nya_02_ros2 --coarse --manual
+
+# 查看各任务详细说明与数据要求
+./calib_unified_run.sh --task-help
+./calib_unified_run.sh --help
+```
+
+| 选项 | 说明 |
+|------|------|
+| `--config <file>` | 配置文件，默认 `calib_unified/config/unicalib_example.yaml` |
+| `--data-dir <dir>` | 宿主机数据根目录，挂载为容器内 CALIB_DATA_DIR |
+| `--dataset <名>` | 数据集子目录，实际数据目录 = `<data-dir>/<名>`，例：`nya_02_ros2` |
+| `--coarse` | 启用 AI 粗标定 |
+| `--manual` | 外参任务启用手动校准 |
+
+## 快速开始（手动编译）
 
 ```bash
 # 1. 编译 (在 Docker 容器中)
@@ -87,34 +121,24 @@ mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# 2. IMU 内参标定
-./bin/unicalib_imu_intrinsic \
-  --data_file /path/to/imu.csv \
-  --sensor_id imu_0 \
-  --output_dir ./output/imu
+# 2. IMU 内参标定（使用统一配置或独立参数）
+./bin/unicalib_imu_intrinsic --config config/unicalib_example.yaml
+# 或: --data_file /path/to/imu.csv --sensor_id imu_0 --output_dir ./output/imu
 
 # 3. 相机内参标定
-./bin/unicalib_camera_intrinsic \
-  --images_dir /path/to/chessboard_images/ \
-  --model pinhole \
-  --sensor_id cam_0
+./bin/unicalib_camera_intrinsic --config config/unicalib_example.yaml
+# 或: --images_dir /path/to/chessboard_images/ --model pinhole --sensor_id cam_0
 
-# 4. IMU-LiDAR 外参标定
-./bin/unicalib_imu_lidar \
-  --config config/imu_lidar_example.yaml
-
-# 5. LiDAR-Camera 外参标定
-./bin/unicalib_lidar_camera \
-  --config config/lidar_camera_example.yaml
-
-# 6. Camera-Camera 外参标定
-./bin/unicalib_cam_cam \
-  --config config/cam_cam_example.yaml
-
-# 7. 联合标定 (全传感器)
-./bin/unicalib_joint \
-  --config config/joint_example.yaml
+# 4–7. 外参与联合标定（均使用同一配置文件）
+./bin/unicalib_imu_lidar     --config config/unicalib_example.yaml
+./bin/unicalib_lidar_camera  --config config/unicalib_example.yaml
+./bin/unicalib_cam_cam       --config config/unicalib_example.yaml
+./bin/unicalib_joint         --config config/unicalib_example.yaml
 ```
+
+## 配置文件
+
+全工程**唯一配置文件**：`config/unicalib_example.yaml`。所有标定任务（imu-intrin / cam-intrin / imu-lidar / lidar-cam / cam-cam / joint）均使用该文件；内含传感器定义、数据路径、各任务参数及详细注释。数据路径可使用 `--data-dir`、`--dataset`（如 `nya_02_ros2`）与脚本配合使用，见上文「一键脚本」示例。
 
 ## IMU 数据格式 (CSV)
 
@@ -190,7 +214,7 @@ graph TD
 
 ## 风险与已知限制
 
-|| 项目 | 状态 | 说明 |
+| 项目 | 状态 | 说明 |
 |---|---|---|
 | iKalibr B样条联合精化 | ✅ 框架实现 | phase3_joint_refine 已包含完整集成代码；数据转换层与结果回写已实现骨架 |
 | LiDAR 棋盘格检测 | ✅ 已实现 | 体素下采样 → RANSAC 平面拟合 → 生成网格角点 |

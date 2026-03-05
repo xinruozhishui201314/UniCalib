@@ -70,23 +70,55 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
             YAML::Node n = YAML::LoadFile(argv[++i]);
-            if (n["images_dir"])   images_dir  = n["images_dir"].as<std::string>();
-            if (n["model"])        model_str   = n["model"].as<std::string>();
-            if (n["output_dir"])   output_dir  = n["output_dir"].as<std::string>();
-            if (n["sensor_id"])    sensor_id   = n["sensor_id"].as<std::string>();
-            if (n["target"]) {
-                auto t = n["target"];
-                if (t["cols"])        cfg.target.cols  = t["cols"].as<int>();
-                if (t["rows"])        cfg.target.rows  = t["rows"].as<int>();
-                if (t["square_size"]) cfg.target.square_size_m = t["square_size"].as<double>();
-                if (t["type"]) {
-                    std::string ts = t["type"].as<std::string>();
-                    if (ts == "circles")   cfg.target.type = TargetConfig::Type::CIRCLES_GRID;
-                    else if (ts == "asym_circles") cfg.target.type = TargetConfig::Type::ASYMMETRIC_CIRCLES;
+            // 统一配置: data + sensors，取第一个 camera
+            if (n["data"] && n["sensors"]) {
+                for (const auto& s : n["sensors"]) {
+                    if (s["type"] && s["type"].as<std::string>() == "camera") {
+                        sensor_id = s["id"].as<std::string>();
+                        if (n["data"]["camera"] && n["data"]["camera"][sensor_id]) {
+                            auto cam = n["data"]["camera"][sensor_id];
+                            if (cam["images_dir"]) images_dir = cam["images_dir"].as<std::string>();
+                        }
+                        break;
+                    }
                 }
+                if (n["output_dir"]) output_dir = n["output_dir"].as<std::string>();
+                if (n["camera_intrinsic"]) {
+                    const auto& ci = n["camera_intrinsic"];
+                    if (ci["model"])        model_str = ci["model"].as<std::string>();
+                    if (ci["min_images"])   cfg.min_images = ci["min_images"].as<int>();
+                    if (ci["max_images"])   cfg.max_images = ci["max_images"].as<int>();
+                    if (ci["target"]) {
+                        auto t = ci["target"];
+                        if (t["cols"])        cfg.target.cols  = t["cols"].as<int>();
+                        if (t["rows"])        cfg.target.rows  = t["rows"].as<int>();
+                        if (t["square_size"]) cfg.target.square_size_m = t["square_size"].as<double>();
+                        if (t["type"]) {
+                            std::string ts = t["type"].as<std::string>();
+                            if (ts == "circles")         cfg.target.type = TargetConfig::Type::CIRCLES_GRID;
+                            else if (ts == "asym_circles") cfg.target.type = TargetConfig::Type::ASYMMETRIC_CIRCLES;
+                        }
+                    }
+                }
+            } else {
+                if (n["images_dir"])   images_dir  = n["images_dir"].as<std::string>();
+                if (n["model"])        model_str   = n["model"].as<std::string>();
+                if (n["output_dir"])   output_dir  = n["output_dir"].as<std::string>();
+                if (n["sensor_id"])    sensor_id   = n["sensor_id"].as<std::string>();
+                if (n["target"]) {
+                    auto t = n["target"];
+                    if (t["cols"])        cfg.target.cols  = t["cols"].as<int>();
+                    if (t["rows"])        cfg.target.rows  = t["rows"].as<int>();
+                    if (t["square_size"]) cfg.target.square_size_m = t["square_size"].as<double>();
+                    if (t["type"]) {
+                        std::string ts = t["type"].as<std::string>();
+                        if (ts == "circles")   cfg.target.type = TargetConfig::Type::CIRCLES_GRID;
+                        else if (ts == "asym_circles") cfg.target.type = TargetConfig::Type::ASYMMETRIC_CIRCLES;
+                    }
+                }
+                if (n["min_images"]) cfg.min_images = n["min_images"].as<int>();
+                if (n["max_images"]) cfg.max_images = n["max_images"].as<int>();
             }
-            if (n["min_images"]) cfg.min_images = n["min_images"].as<int>();
-            if (n["max_images"]) cfg.max_images = n["max_images"].as<int>();
         } else if (arg == "--images_dir" && i + 1 < argc) {
             images_dir = argv[++i];
         } else if (arg == "--model" && i + 1 < argc) {

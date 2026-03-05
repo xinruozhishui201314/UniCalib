@@ -39,6 +39,7 @@ CALIB_DATA_DIR=/path/to/data ./build_and_run.sh
 - `./build_and_run.sh --shell` - 进入容器交互式Shell
 
 **详细文档**：
+- [calib_unified 一键脚本使用说明](CALIB_UNIFIED_USAGE.md) - calib_unified_run.sh、唯一配置与数据路径
 - [外部工具编译指南](BUILD_EXTERNAL_TOOLS.md) - 编译DM-Calib, iKalibr等外部工具
 - [快速开始](QUICK_START.md) - 三步快速配置和运行
 - [LiDAR-Camera和Camera-Camera外参指南](LIDAR_CAMERA_AND_CAMERA_CAMERA.md) - 外参标定详细指南
@@ -78,6 +79,8 @@ source ./auto_config_env.sh
 | 目录 | 说明 |
 |------|------|
 | **unicalib_C_plus_plus/** | **主框架**：C++ 实现，本项目的编译与运行均在此完成 |
+| **calib_unified/** | 多传感器统一标定 C++ 模块（IMU/相机/LiDAR 内参与外参、联合标定） |
+| **calib_unified_run.sh** | calib_unified 一键脚本：编译 + 验证 + 标定运行，全工程唯一配置见 [calib_unified/README.md](calib_unified/README.md) |
 | **UniCalib/** | 参考实现：Python 版标定逻辑与设计参考，不参与本项目的主流程编译与运行 |
 | **docker/** | Docker 构建与依赖（用于一键脚本） |
 | **build_and_run.sh** | 一键编译和运行脚本（推荐使用） |

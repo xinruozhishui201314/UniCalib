@@ -274,7 +274,7 @@ make -j$(nproc)
 
 ```bash
 # IMU 内参标定
-./bin/unicalib_imu_intrinsic --config config/imu_intrinsic_example.yaml --enable-viz
+./bin/unicalib_imu_intrinsic --config config/unicalib_example.yaml --enable-viz
 
 # IMU-LiDAR 外参标定
 ./bin/unicalib_imu_lidar_extrin --config config/imu_lidar_example.yaml --enable-viz

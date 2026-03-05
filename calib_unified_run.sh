@@ -13,9 +13,11 @@
 #   ./calib_unified_run.sh --shell                 # 进入容器调试
 #   ./calib_unified_run.sh --check-deps            # 检查容器内依赖
 #   ./calib_unified_run.sh --clean                 # 清理后重新编译
+#   ./calib_unified_run.sh --task-help             # 各标定任务详细说明与数据要求
 #
-# 标定任务 (--task):
-#   all  imu-intrin  cam-intrin  imu-lidar  lidar-cam  cam-cam  joint
+# 标定任务 (--task)；全工程唯一配置: config/unicalib_example.yaml
+#   imu-intrin   IMU内参   cam-intrin 相机内参   imu-lidar IMU-雷达外参
+#   lidar-cam 雷达-相机外参   cam-cam 相机-相机外参   joint/all 联合标定
 #
 # 环境变量:
 #   CALIB_DATA_DIR      数据目录   (默认: $PROJECT/data)
@@ -57,6 +59,7 @@ DOCKER_GPU_FLAGS="${DOCKER_GPU_FLAGS:---gpus all}"
 MODE="default"   # default | build-only | test-only | run | shell | check-deps
 CALIB_TASK="all"
 CALIB_CONFIG=""
+CALIB_DATASET=""   # 可选，如 nya_02_ros2 → 数据目录为 $CALIB_DATA_DIR/$CALIB_DATASET
 DO_COARSE=false
 DO_MANUAL=false
 BUILD_TYPE="Release"
@@ -102,19 +105,31 @@ print_help() {
   --check-deps                 检查容器内 C++ 依赖可用性
   --clean                      清理构建目录后重新编译
 
-标定 (--run 模式):
-  --task <t>     any|imu-intrin|cam-intrin|imu-lidar|lidar-cam|cam-cam|joint
-  --config <f>   配置文件 (默认: calib_unified/config/joint_example.yaml)
-  --coarse       启用 AI 粗标定 (DM-Calib/MIAS-LCEC/L2Calib)
-  --manual       启用手动校准 (外参精度不足时交互调整)
+标定任务 (--run 时 --task <名称>):
+  imu-intrin    IMU 内参标定 (Allan 方差 + 可选 Transformer-IMU 粗估)
+  cam-intrin    相机内参标定 (棋盘格标定 + 可选 DM-Calib 粗估)
+  imu-lidar     IMU 与雷达外参标定 (B 样条 + 可选 L2Calib 粗估)
+  lidar-cam     雷达与相机外参标定 (边缘对齐 + 可选 MIAS-LCEC 粗估)
+  cam-cam       相机与相机外参标定 (BA + 特征匹配)
+  joint / all   联合标定 (上述全部或可选组合，由 unicalib_joint 执行)
+
+标定 (--run 模式，全部使用同一配置 unicalib_example.yaml):
+  --task <t>     任务: imu-intrin | cam-intrin | imu-lidar | lidar-cam | cam-cam | joint (默认 all)
+  --config <f>   配置文件 (默认 calib_unified/config/unicalib_example.yaml)
+  --data-dir <d> 数据根目录；或 --dataset <名> 使用 data/<名>（如 nya_02_ros2）
+  --coarse       启用 AI 粗标定
+  --manual       启用手动校准 (外参任务)
+
+  --task-help    显示各标定任务的详细说明与数据要求
 
 编译:
   --debug        Debug 模式 (默认 Release)
   --jobs <n>     并行编译数 (默认: nproc)
   --cmake-args   额外 CMake 参数 (用引号包裹)
 
-数据:
-  --data-dir <d>    宿主机数据目录
+数据 (可与 --config 配合，指定本次标定使用的数据来源):
+  --data-dir <d>    宿主机数据根目录 (挂载为容器内 CALIB_DATA_DIR)
+  --dataset <名>    数据集子目录，数据目录 = <data-dir>/<名>，例: --dataset nya_02_ros2
   --results-dir <d> 宿主机结果目录
 
 日志:
@@ -130,6 +145,106 @@ print_help() {
   J                  并行编译数
 
 HELPEOF
+}
+
+# 各标定任务的详细说明（数据要求、配置、示例命令）
+print_task_help() {
+    cat << 'TASKHELP'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  标定任务详细说明 — 数据要求、推荐配置与示例命令                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+■ imu-intrin — IMU 内参标定
+  ─────────────────────────────────────────────────────────────────────────
+  说明: 标定 IMU 的噪声密度、随机游走、尺度与安装偏置等内参，用于提高
+        IMU 积分与融合精度。
+  方法: Allan 方差分析 + 可选 Transformer-IMU-Calibrator 粗估计。
+  数据要求:
+    • 静态 IMU 数据：设备静止放置，时长建议 ≥ 2 小时（或按 Allan 曲线需求）
+    • 数据格式：ROS bag（/imu 或配置中指定的 topic）或项目支持的 IMU 数据文件
+  配置文件: 全工程唯一配置 calib_unified/config/unicalib_example.yaml
+  示例命令:
+    ./calib_unified_run.sh --run --task imu-intrin
+    ./calib_unified_run.sh --run --task imu-intrin --config calib_unified/config/unicalib_example.yaml
+  输出: 标定后的 IMU 内参 YAML（噪声、偏置等），可写入传感器配置或 joint 配置。
+
+■ cam-intrin — 相机内参标定
+  ─────────────────────────────────────────────────────────────────────────
+  说明: 标定相机内参（焦距、主点、畸变系数），用于去畸变与 3D 重建。
+  方法: 棋盘格/标定板 + 可选 DM-Calib 粗估计。
+  数据要求:
+    • 多角度拍摄标定板的图像或图像序列（或带 /camera/image 的 ROS bag）
+    • 标定板类型与尺寸需与配置中一致（如棋盘格行列数、格子大小）
+  配置文件: 全工程唯一配置 calib_unified/config/unicalib_example.yaml
+  示例命令:
+    ./calib_unified_run.sh --run --task cam-intrin
+    ./calib_unified_run.sh --run --task cam-intrin --config calib_unified/config/unicalib_example.yaml
+  输出: 相机内参 YAML（K、畸变模型与参数），供外参标定或联合标定使用。
+
+■ imu-lidar — IMU 与雷达外参标定
+  ─────────────────────────────────────────────────────────────────────────
+  说明: 标定 IMU 与 LiDAR 之间的相对位姿 T_imu_lidar，用于紧耦合融合与定位。
+  方法: 基于运动的 B 样条优化 + 可选 L2Calib 粗估计。
+  数据要求:
+    • 同步的 IMU 数据 + LiDAR 点云（ROS bag 或等价的时序数据）
+    • 采集时需有充分激励：加减速、转弯、俯仰/侧倾变化，避免纯匀速直线
+  配置文件: 全工程唯一配置 calib_unified/config/unicalib_example.yaml
+  示例命令:
+    ./calib_unified_run.sh --run --task imu-lidar
+    ./calib_unified_run.sh --run --task imu-lidar --coarse
+  输出: T_imu_lidar 外参（或写入 joint 配置），供融合与联合标定使用。
+
+■ lidar-cam — 雷达与相机外参标定
+  ─────────────────────────────────────────────────────────────────────────
+  说明: 标定 LiDAR 与相机之间的外参 T_lidar_cam，用于点云与图像对齐、融合。
+  方法: 边缘/特征对齐 + 可选 MIAS-LCEC 粗估计；可选无目标方法。
+  数据要求:
+    • 同步的 LiDAR 点云 + 相机图像（ROS bag 或等价的时序数据）
+    • 场景最好包含清晰边缘/结构（如建筑物、标定板边缘），避免单调纹理
+  配置文件: 全工程唯一配置 calib_unified/config/unicalib_example.yaml
+  示例命令:
+    ./calib_unified_run.sh --run --task lidar-cam
+    ./calib_unified_run.sh --run --task lidar-cam --config calib_unified/config/unicalib_example.yaml
+    ./calib_unified_run.sh --run --task lidar-cam --config calib_unified/config/unicalib_example.yaml --dataset nya_02_ros2
+    ./calib_unified_run.sh --run --task lidar-cam --data-dir /path/to/data --dataset nya_02_ros2 --coarse --manual
+  输出: T_lidar_cam 外参；若精度不足可结合 --manual 进行交互微调。
+
+■ cam-cam — 相机与相机外参标定
+  ─────────────────────────────────────────────────────────────────────────
+  说明: 标定多相机之间的外参（如双目或前/后/环视），用于多视角融合与 3D。
+  方法: 特征匹配 + 束调整（BA）；可结合标定板或自然特征。
+  数据要求:
+    • 多相机同步或时序对齐的图像（ROS bag 或图像序列）
+    • 各相机内参建议先由 cam-intrin 标定好，或配置中提供
+  配置文件: 全工程唯一配置 calib_unified/config/unicalib_example.yaml
+  示例命令:
+    ./calib_unified_run.sh --run --task cam-cam
+    ./calib_unified_run.sh --run --task cam-cam --manual
+  输出: 相机间外参；--manual 可在精度不足时进行手动微调。
+
+■ joint / all — 联合标定
+  ─────────────────────────────────────────────────────────────────────────
+  说明: 一次性运行多种标定（可仅选其中几项，由 unicalib_joint 内部 --imu-intrin
+       等标志控制）。适合整机标定流程或依赖内参的外参联合优化。
+  方法: 按配置与任务选择依次/联合执行 imu-intrin、cam-intrin、imu-lidar、
+        lidar-cam、cam-cam；可选 AI 粗标定与手动校准。
+  数据要求: 满足所勾选任务的数据（见上各任务）。
+  配置文件: 全工程唯一配置 calib_unified/config/unicalib_example.yaml
+  示例命令:
+    ./calib_unified_run.sh --run --task joint
+    ./calib_unified_run.sh --run --task joint --coarse --manual
+  输出: 各任务结果写入同一输出目录，便于统一写入车辆配置。
+
+────────────────────────────────────────────────────────────────────────────────
+通用提示:
+  • 全工程唯一配置: calib_unified/config/unicalib_example.yaml（--run 时默认使用）。
+  • 数据路径: 默认数据目录 CALIB_DATA_DIR 或 ./data；可用 --data-dir <路径> 指定根目录。
+  • 数据集: 使用 --dataset <名>（如 nya_02_ros2）时，数据目录为 <data-dir>/<名>。
+  • 结果目录: 默认 CALIB_RESULTS_DIR 或 ./results；可用 --results-dir 指定。
+  • --coarse 会调用相应 AI 模型（需已挂载 DM-Calib/MIAS-LCEC 等），首次可能较慢。
+  • --manual 仅对外参任务生效，用于启动交互式手动校准工具。
+
+TASKHELP
 }
 
 # ─── 解析参数 ─────────────────────────────────────────────────────────────────
@@ -151,13 +266,22 @@ parse_args() {
             --log-level)   shift; LOG_LEVEL="$1" ;;
             --cmake-args)  shift; EXTRA_CMAKE_ARGS="$1" ;;
             --data-dir)    shift; CALIB_DATA_DIR="$1" ;;
+            --dataset)     shift; CALIB_DATASET="$1" ;;
             --results-dir) shift; CALIB_RESULTS_DIR="$1" ;;
+            --task-help)   print_banner; print_task_help; exit 0 ;;
             --help|-h)     print_banner; print_help; exit 0 ;;
             *) log_warn "未知参数: $1" ;;
         esac
         shift
     done
-    CALIB_CONFIG="${CALIB_CONFIG:-${CALIB_UNIFIED_DIR}/config/joint_example.yaml}"
+    # 全工程唯一配置文件（未指定 --config 时使用）
+    if [[ -z "${CALIB_CONFIG}" ]]; then
+        CALIB_CONFIG="${CALIB_UNIFIED_DIR}/config/unicalib_example.yaml"
+    fi
+    # --dataset <name>：数据目录设为 $CALIB_DATA_DIR/<name>，便于按数据集切换（如 nya_02_ros2）
+    if [[ -n "${CALIB_DATASET}" ]]; then
+        CALIB_DATA_DIR="${CALIB_DATA_DIR}/${CALIB_DATASET}"
+    fi
 }
 
 # ─── 检查 Docker ───────────────────────────────────────────────────────────────
@@ -616,18 +740,19 @@ gen_run_script() {
     if [[ "${config_host}" == "${CALIB_UNIFIED_DIR}"* ]]; then
         cfg_container="${CONTAINER_CALIB}${config_host#${CALIB_UNIFIED_DIR}}"
     else
-        cfg_container="${CONTAINER_CALIB}/config/joint_example.yaml"
+        cfg_container="${CONTAINER_CALIB}/config/unicalib_example.yaml"
     fi
 
-    # 映射 task → 可执行文件 + 参数
-    local exe task_flags
+    # 映射 task → 可执行文件 + 参数 + 任务说明（用于运行前提示）
+    local exe task_flags task_desc
     case "${task}" in
-        imu-intrin) exe="unicalib_imu_intrinsic";   task_flags="" ;;
-        cam-intrin) exe="unicalib_camera_intrinsic"; task_flags="" ;;
-        imu-lidar)  exe="unicalib_imu_lidar";        task_flags="" ;;
-        lidar-cam)  exe="unicalib_lidar_camera";     task_flags="" ;;
-        cam-cam)    exe="unicalib_cam_cam";          task_flags="" ;;
-        *)          exe="unicalib_joint";            task_flags="--all" ;;
+        imu-intrin) exe="unicalib_imu_intrinsic";   task_flags=""; task_desc="IMU 内参标定 (Allan 方差 + 可选 Transformer-IMU)" ;;
+        cam-intrin) exe="unicalib_camera_intrinsic"; task_flags=""; task_desc="相机内参标定 (棋盘格 + 可选 DM-Calib)" ;;
+        imu-lidar)  exe="unicalib_imu_lidar";        task_flags=""; task_desc="IMU 与雷达外参 (B 样条 + 可选 L2Calib)" ;;
+        lidar-cam)  exe="unicalib_lidar_camera";     task_flags=""; task_desc="雷达与相机外参 (边缘对齐 + 可选 MIAS-LCEC)" ;;
+        cam-cam)    exe="unicalib_cam_cam";          task_flags=""; task_desc="相机与相机外参 (BA + 特征匹配)" ;;
+        joint|all)  exe="unicalib_joint";            task_flags="--all"; task_desc="联合标定 (多种任务组合)" ;;
+        *)          exe="unicalib_joint";            task_flags="--all"; task_desc="见 --task-help 查看任务说明" ;;
     esac
 
     [[ "${coarse}" == "true" ]] && task_flags="${task_flags} --coarse"
@@ -654,9 +779,24 @@ if [[ ! -f "\${EXE}" ]]; then
 fi
 if [[ ! -f "\${CONFIG}" ]]; then
     echo "[WARN] 配置文件不存在: \${CONFIG}"
-    echo "[WARN] 使用默认配置..."
-    CONFIG="${CONTAINER_CALIB}/config/joint_example.yaml"
+    echo "[WARN] 使用默认唯一配置..."
+    CONFIG="${CONTAINER_CALIB}/config/unicalib_example.yaml"
 fi
+
+echo ""
+echo "┌─────────────────────────────────────────────────────────────────────────┐"
+echo "│  运行前检查 — 请确认以下项                                                │"
+echo "├─────────────────────────────────────────────────────────────────────────┤"
+echo "│  当前任务: ${task}"
+echo "│  说明:     ${task_desc}"
+echo "│  配置文件: \${CONFIG}  (全工程唯一配置)"
+echo "│  数据目录: ${CONTAINER_DATA}  (宿主机: 请将数据放入 CALIB_DATA_DIR)"
+echo "│  结果目录: ${CONTAINER_RESULTS}"
+echo "│  可执行:   \${EXE}"
+echo "│  选项:     coarse=${coarse}  manual=${manual}"
+echo "└─────────────────────────────────────────────────────────────────────────┘"
+echo "  详细任务说明与数据要求: 宿主机执行 ./calib_unified_run.sh --task-help"
+echo ""
 
 LOG_FILE="${CONTAINER_LOGS}/run_${task}_\$(date +%Y%m%d_%H%M%S).log"
 echo "[INFO] 配置: \${CONFIG}"
@@ -709,7 +849,7 @@ echo ""
 echo "  常用命令:"
 echo "    cd ${CONTAINER_BUILD} && ls bin/"
 echo "    ${CONTAINER_BIN}/unicalib_joint --help"
-echo "    ${CONTAINER_BIN}/unicalib_joint --config ${CONTAINER_CALIB}/config/joint_example.yaml --all"
+echo "    ${CONTAINER_BIN}/unicalib_joint --config ${CONTAINER_CALIB}/config/unicalib_example.yaml --all"
 echo ""
 exec bash
 SCRIPTEOF
@@ -837,14 +977,20 @@ main() {
             log_ok "一键编译 + 验证完成!"
             echo ""
             echo -e "${CYAN}${BOLD}后续用法:${NC}"
-            echo "  # 运行联合标定:"
+            echo "  # 查看各标定任务详细说明与数据要求:"
+            echo "  ./calib_unified_run.sh --task-help"
+            echo ""
+            echo "  # 按任务运行（均使用 calib_unified/config/unicalib_example.yaml）:"
+            echo "  ./calib_unified_run.sh --run --task imu-intrin"
+            echo "  ./calib_unified_run.sh --run --task cam-intrin"
+            echo "  ./calib_unified_run.sh --run --task imu-lidar"
+            echo "  ./calib_unified_run.sh --run --task lidar-cam"
+            echo "  ./calib_unified_run.sh --run --task cam-cam"
             echo "  ./calib_unified_run.sh --run --task joint"
             echo ""
-            echo "  # 带AI粗标定的 LiDAR-Camera:"
-            echo "  ./calib_unified_run.sh --run --task lidar-cam --coarse"
-            echo ""
-            echo "  # 精度不足时启用手动校准:"
-            echo "  ./calib_unified_run.sh --run --task lidar-cam --manual"
+            echo "  # 指定数据路径（如使用 nya_02_ros2 数据集）:"
+            echo "  ./calib_unified_run.sh --run --task lidar-cam --config calib_unified/config/unicalib_example.yaml --dataset nya_02_ros2"
+            echo "  ./calib_unified_run.sh --run --task lidar-cam --data-dir /path/to/data --dataset nya_02_ros2 --coarse --manual"
             echo ""
             echo "  # 进入容器调试:"
             echo "  ./calib_unified_run.sh --shell" ;;
