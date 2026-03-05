@@ -59,15 +59,18 @@ namespace ns_ikalibr {
     spdlog::warn(fmt::format(fmt::emphasis::italic | fmt::fg(fmt::color::red), \
                              "(iKalibr-DEBUG) {}", IKALIBR_CODE_POS));
 
-enum class Status : std::uint8_t { FINE, WARNING, ERROR, CRITICAL };
+// 使用 IKalibrStatusLevel 避免与 ns_unicalib::Status 类命名冲突。
+// 保留 Status 别名以兼容现有 iKalibr 代码；联合编译时请使用 ns_ikalibr::Status 或 IKalibrStatusLevel。
+enum class IKalibrStatusLevel : std::uint8_t { FINE, WARNING, ERROR, CRITICAL };
+using Status = IKalibrStatusLevel;
 
 struct IKalibrStatus : std::exception {
 public:
-    Status flag;
+    IKalibrStatusLevel flag;
     std::string what;
 
 public:
-    IKalibrStatus(Status flag, std::string what)
+    IKalibrStatus(IKalibrStatusLevel flag, std::string what)
         : flag(flag),
           what(std::move(what)) {}
 
@@ -77,13 +80,13 @@ public:
     }
 };
 
-/// Build IKalibrStatus from (Status, string). Use when Status(flag, fmt, ...) would be parsed as a cast.
-inline IKalibrStatus MakeIKalibrStatus(Status flag, std::string what) {
-    return IKalibrStatus(flag, std::move(what));
+/// Build IKalibrStatus from (level, string). Use when Status(flag, fmt, ...) would be parsed as a cast.
+inline IKalibrStatus MakeIKalibrStatus(IKalibrStatusLevel level, std::string what) {
+    return IKalibrStatus(level, std::move(what));
 }
 
 template <typename... T>
-IKalibrStatus Status(Status flag, fmt::format_string<T...> fmt, T &&...args) {
+IKalibrStatus Status(IKalibrStatusLevel flag, fmt::format_string<T...> fmt, T &&...args) {
     return IKalibrStatus(flag, fmt::format(fmt, args...));
 }
 }  // namespace ns_ikalibr

@@ -33,6 +33,10 @@
 #include "unicalib/viz/cloud_viewer.h"
 #include "unicalib/common/sensor_types.h"
 #include "unicalib/common/calib_param.h"
+#include "unicalib/extrinsic/imu_lidar_calib.h"
+#include "unicalib/intrinsic/imu_intrinsic_calib.h"
+#include "unicalib/viz/report_gen.h"
+#include "unicalib/common/logger.h"
 #include <Eigen/Core>
 #include <sophus/se3.hpp>
 #include <opencv2/core.hpp>
@@ -45,6 +49,12 @@
 #include <mutex>
 
 namespace ns_unicalib {
+
+// 相机帧 (用于 LiDAR-Camera 投影可视化，仅需时间戳与图像)
+struct CameraFrame {
+    double timestamp = 0.0;
+    cv::Mat image;
+};
 
 // 统一可视化数据容器 (用于 viz_data_ 与 to_json 等)
 struct VisualizationData {
@@ -349,12 +359,34 @@ public:
                                 bool block = true);
 
     /**
-     * @brief 显示点云投影到图像
-     * 深度着色 (红近蓝远)
+     * @brief 显示点云投影到图像 (LiDARCamVizData 版本)
      */
     cv::Mat show_projection_to_image(const LiDARCamVizData& data,
                                       double min_depth = 0.5,
                                       double max_depth = 50.0);
+
+    /**
+     * @brief 显示 LiDAR 点云投影到相机图像 (向量版本)
+     */
+    void show_lidar_camera_projection(const std::vector<LiDARScan>& lidar_scans,
+                                      const std::vector<CameraFrame>& camera_frames,
+                                      const ExtrinsicSE3& extrinsic,
+                                      const CameraIntrinsics& intrinsics,
+                                      bool save_images = false);
+
+    /**
+     * @brief 显示图像对齐
+     */
+    void show_image_alignment(const std::vector<CameraFrame>& camera_frames,
+                              const ExtrinsicSE3& extrinsic,
+                              const CameraIntrinsics& intrinsics);
+
+    /**
+     * @brief 显示点云对齐前后对比
+     */
+    void show_cloud_alignment(const std::vector<LiDARScan>& scans_before,
+                              const std::vector<LiDARScan>& scans_after,
+                              const ExtrinsicSE3& extrinsic);
 
     /**
      * @brief 显示边缘对齐
@@ -447,15 +479,15 @@ public:
      * 3D 椭圆表示位置/旋转不确定性
      */
     void show_uncertainty_ellipse(const Sophus::SE3d& pose,
-                                   const Eigen::Matrix6d& covariance,
+                                   const Eigen::Matrix<double, 6, 6>& covariance,
                                    const std::string& id,
                                    double sigma = 3.0);
 
     // -------------------------------------------------------------------------
-    // 3D 点云查看器访问
+    // 3D 点云查看器访问 (get_cloud_viewer 在 cpp 中实现，因需延迟创建 viewer)
     // -------------------------------------------------------------------------
-    CloudViewer::Ptr get_3d_viewer() { return cloud_viewer_; }
-    CloudViewer::Ptr get_cloud_viewer() { return cloud_viewer_; }
+    CloudViewer::Ptr get_3d_viewer() { return get_cloud_viewer(); }
+    CloudViewer::Ptr get_cloud_viewer();
 
     // 直接添加元素到 3D 查看器
     void add_point_cloud(const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud,
@@ -477,6 +509,12 @@ public:
 
     void save_screenshot(const std::string& filename);
     void save_all_plots(const std::string& output_dir);
+    void save_plots(const std::string& output_path);
+    void save_calibration_results(const CalibParamManager& params, const std::string& output_dir, const std::string& format);
+    void generate_report(const std::string& output_path);
+    void add_visualization_data(const std::string& key, const VisualizationData& data);
+    cv::Mat draw_imu_lidar_result_summary(const ExtrinsicSE3& coarse, const ExtrinsicSE3& fine,
+                                          const std::vector<double>& rot_errors, const std::vector<double>& trans_errors);
 
     // -------------------------------------------------------------------------
     // 进度报告
@@ -505,6 +543,10 @@ private:
         const std::string& title,
         int plot_width,
         int plot_height);
+    cv::Mat draw_camera_reprojection_errors(
+        const std::vector<Eigen::Vector2d>& corners_2d,
+        const std::vector<Eigen::Vector2d>& corners_reprojected,
+        const std::string& title);
     cv::Mat plot_time_offset_convergence_curve(
         const std::vector<double>& time_offsets,
         const std::vector<double>& costs,

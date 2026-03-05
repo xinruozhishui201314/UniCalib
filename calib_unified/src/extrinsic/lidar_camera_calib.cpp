@@ -362,8 +362,10 @@ bool LiDARCameraCalibrator::detect_board_in_lidar(
     
     // Step 6.4: 角点网格正则化 (确保等间距)
     if (refined_corners.size() == rows * cols) {
-        // 计算理想的角点网格
-        Eigen::Vector3d grid_origin = refined_centroid;
+        // 计算理想的角点网格（centroid 与 Step 6.3 一致，此处显式计算以保持作用域）
+        Eigen::Vector3d grid_origin = Eigen::Vector3d::Zero();
+        for (const auto& c : refined_corners) grid_origin += c;
+        grid_origin /= static_cast<double>(refined_corners.size());
         Eigen::Vector3d grid_u = u_axis * cell_w;
         Eigen::Vector3d grid_v = v_axis * cell_h;
         

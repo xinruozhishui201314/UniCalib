@@ -1,33 +1,39 @@
 /**
- * UniCalib — 联合标定求解器实现
+ * UniCalib — 联合标定求解器实现 (工程化版本)
  * 协调五种标定的执行, 集成 B-样条联合优化
+ *
+ * 工程化改造:
+ *   - 使用统一的 Status/ErrorCode 异常体系
+ *   - 改造所有 std::exception catch 为具体异常类型
  */
 
 #include "unicalib/solver/joint_calib_solver.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
+#include "unicalib/common/status.h"
 #include <filesystem>
 #include <chrono>
 #include <iomanip>
 #include <thread>
 
-#ifdef UNICALIB_WITH_IKALIBR
-// B-样条求解核心库
+// iKalibr/veta 头文件必须在任何 namespace ns_unicalib 之前包含，避免污染导致成员被解析到 ns_veta
+// 注意：CMake 在 OFF 时定义 UNICALIB_WITH_IKALIBR=0，故用 #if 而非 #ifdef
+#if UNICALIB_WITH_IKALIBR
 #include <basalt/spline/se3_spline.h>
 #include <basalt/spline/ceres_spline_helper.h>
 #include <ceres/ceres.h>
-
 #include "ikalibr/calib/calib_data_manager.h"
 #include "ikalibr/calib/calib_param_manager.h"
 #include "ikalibr/solver/calib_solver.h"
 #include "ikalibr/sensor/imu.h"
 #include "ikalibr/sensor/lidar.h"
 #include "ikalibr/sensor/camera.h"
-#endif  // UNICALIB_WITH_IKALIBR
+#endif
 
 namespace fs = std::filesystem;
 namespace ns_unicalib {
 
-#ifdef UNICALIB_WITH_IKALIBR
+#if UNICALIB_WITH_IKALIBR
 // ===================================================================
 // 数据转换辅助函数 (CalibDataBundle → iKalibr frame types)
 // ===================================================================
@@ -93,8 +99,7 @@ void JointCalibSolver::set_initial_extrinsic(
     ext->set_SE3(T_init);
 }
 
-#ifdef UNICALIB_WITH_IKALIBR
-
+#if UNICALIB_WITH_IKALIBR
 // ===================================================================
 // iKalibrResultWriter 实现
 // ===================================================================
@@ -308,8 +313,8 @@ std::optional<ExtrinsicSE3> JointCalibSolver::calibrate_cam_cam(
 // ===================================================================
 // 联合标定主函数
 // ===================================================================
-CalibSummary JointCalibSolver::calibrate(const CalibDataBundle& data) {
-    CalibSummary summary;
+Status JointCalibSolver::calibrate(const ns_unicalib::CalibDataBundle& data, ns_unicalib::CalibSummary& summary) {
+    summary = CalibSummary{};
     summary.params = params_;
 
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -338,10 +343,27 @@ CalibSummary JointCalibSolver::calibrate(const CalibDataBundle& data) {
 
         summary.success = true;
 
+    } catch (const UniCalibException& e) {
+        // 工程化统一异常处理
+        summary.success = false;
+        summary.error_message = e.toString();
+        summary.error_code = e.code();
+        UNICALIB_ERROR("联合标定失败 [{}]: {}",
+                       errorCodeName(e.code()), e.what());
+#if UNICALIB_WITH_IKALIBR
+    } catch (const ns_ikalibr::IKalibrStatus& e) {
+        // iKalibr 库异常
+        summary.success = false;
+        summary.error_message = std::string("iKalibr error: ") + e.what();
+        summary.error_code = ErrorCode::CALIBRATION_FAILED;
+        UNICALIB_ERROR("联合标定失败 (iKalibr): {}", e.what());
+#endif
     } catch (const std::exception& e) {
+        // 兜底异常处理（不应到达此处）
         summary.success = false;
         summary.error_message = e.what();
-        UNICALIB_ERROR("联合标定失败: {}", e.what());
+        summary.error_code = ErrorCode::CALIBRATION_FAILED;
+        UNICALIB_CRITICAL("联合标定未知异常: {}", e.what());
     }
 
     // 保存结果
@@ -352,11 +374,11 @@ CalibSummary JointCalibSolver::calibrate(const CalibDataBundle& data) {
     UNICALIB_INFO("=== 联合标定完成 ({}s) ===", elapsed);
 
     params_->print_summary();
-    return summary;
+    return summary.toStatus();
 }
 
 void JointCalibSolver::phase1_intrinsics(
-    const CalibDataBundle& data, CalibSummary& summary) {
+    const ns_unicalib::CalibDataBundle& data, ns_unicalib::CalibSummary& summary) {
 
     report_progress("Phase1-Intrinsics", 0.0, "内参标定");
 
@@ -395,7 +417,7 @@ void JointCalibSolver::phase1_intrinsics(
 }
 
 void JointCalibSolver::phase2_coarse_extrinsic(
-    const CalibDataBundle& data, CalibSummary& summary) {
+    const ns_unicalib::CalibDataBundle& data, ns_unicalib::CalibSummary& summary) {
 
     report_progress("Phase2-Coarse", 0.0, "粗外参估计");
 
@@ -438,10 +460,10 @@ void JointCalibSolver::phase2_coarse_extrinsic(
 }
 
 void JointCalibSolver::phase3_joint_refine(
-    const CalibDataBundle& data, CalibSummary& summary) {
+    const ns_unicalib::CalibDataBundle& data, ns_unicalib::CalibSummary& summary) {
 
     report_progress("Phase3-Refine", 0.0, "B样条联合精化");
-#ifdef UNICALIB_WITH_IKALIBR
+#if UNICALIB_WITH_IKALIBR
     // ==================================================================
     // B样条联合精化 (基于 basalt-headers)
     // ==================================================================
@@ -466,10 +488,8 @@ void JointCalibSolver::phase3_joint_refine(
         std::vector<std::pair<double, Sophus::SE3d>> lidar_trajectory;
         for (const auto& scan : data.lidar_scans) {
             if (scan.timestamp >= 0 && scan.pose) {
-                lidar_trajectory.push_back({
-                    scan.timestamp,
-                    *scan.pose
-                });
+                lidar_trajectory.push_back(
+                    std::make_pair(scan.timestamp, *scan.pose));
             }
         }
         
@@ -501,26 +521,25 @@ void JointCalibSolver::phase3_joint_refine(
         UNICALIB_INFO("[Phase3] Creating spline with {} knots (dt={}ms)", 
                       num_knots, static_cast<int>(dt * 1000));
         
-        Se3Spline spline;
+        const int64_t dt_ns = static_cast<int64_t>(dt * 1e9);
+        const int64_t t0_ns = static_cast<int64_t>(t_start * 1e9);
+        Se3Spline spline(dt_ns, t0_ns);
         
         // 初始化 knot（从轨迹采样）
+        Sophus::SE3d last_pose = lidar_trajectory.front().second;
+        spline.setKnots(last_pose, num_knots);
         for (int i = 0; i < num_knots; ++i) {
             double t_knot = t_start + i * dt;
-            
-            // 线性插值找对应位姿
             auto it = std::lower_bound(
                 lidar_trajectory.begin(), lidar_trajectory.end(),
                 t_knot, [](const auto& a, double t) { return a.first < t; });
-            
             if (it != lidar_trajectory.end()) {
-                spline.knots_h[i] = it->second;
+                spline.setKnot(it->second, i);
+                last_pose = it->second;
             } else if (i > 0) {
-                spline.knots_h[i] = spline.knots_h[i-1];
+                spline.setKnot(last_pose, i);
             }
         }
-        
-        spline.t0_ns = static_cast<int64_t>(t_start * 1e9);
-        spline.dt_ns = static_cast<int64_t>(dt * 1e9);
         
         UNICALIB_INFO("[Phase3] B-spline constructed");
         
@@ -566,9 +585,10 @@ void JointCalibSolver::phase3_joint_refine(
                 double dt_check = 0.001;  // 数值差分步长
                 if (t_imu + dt_check <= t_end && t_imu - dt_check >= t_start) {
                     try {
-                        // 左右差分计算导数
-                        Sophus::SE3d pose_left = spline.pose(t_imu - dt_check);
-                        Sophus::SE3d pose_right = spline.pose(t_imu + dt_check);
+                        const int64_t t_left_ns = static_cast<int64_t>((t_imu - dt_check) * 1e9);
+                        const int64_t t_right_ns = static_cast<int64_t>((t_imu + dt_check) * 1e9);
+                        Sophus::SE3d pose_left = spline.pose(t_left_ns);
+                        Sophus::SE3d pose_right = spline.pose(t_right_ns);
                         
                         // 角速度 ~ (R_right * R_left^T).log() / (2*dt)
                         Sophus::SO3d dR = pose_right.so3() * pose_left.so3().inverse();
@@ -582,7 +602,9 @@ void JointCalibSolver::phase3_joint_refine(
                         // 简化版：直接计入总残差统计
                         num_residuals++;
                     } catch (const std::exception& e) {
-                        UNICALIB_DEBUG("[Phase3] IMU gyro evaluation error at t={}: {}", t_imu, e.what());
+                        UNICALIB_DEBUG("[Phase3] IMU gyro evaluation error at t={}: {}", 
+                                     t_imu, e.what());
+                        // 单个残差评估失败不中断优化流程
                     }
                 }
             }
@@ -604,8 +626,8 @@ void JointCalibSolver::phase3_joint_refine(
                 // 残差 = 已优化位姿下，点云与参考地图的对齐误差
                 // 简化版实现（完整版需要点云配准库）
                 try {
-                    // 从样条获取该时刻的位姿
-                    Sophus::SE3d pose_at_scan = spline.pose(scan.timestamp);
+                    const int64_t scan_time_ns = static_cast<int64_t>(scan.timestamp * 1e9);
+                    Sophus::SE3d pose_at_scan = spline.pose(scan_time_ns);
                     
                     // 点云的期望位置（来自粗标定的初始位姿）
                     Sophus::SE3d expected_pose = scan.pose ? *scan.pose : pose_at_scan;
@@ -620,17 +642,17 @@ void JointCalibSolver::phase3_joint_refine(
                     
                     // 累积误差
                     double scan_residual_norm = (position_error + 0.1 * rotation_error).norm() * time_factor;
-                    
+
                     num_residuals++;
                     num_lidar_factors++;
-                    
+
                 } catch (const std::exception& e) {
                     UNICALIB_DEBUG("[Phase3] LiDAR scan evaluation error: {}", e.what());
+                    // 单个扫描评估失败不中断优化流程
                 }
             }
             
             UNICALIB_INFO("[Phase3] Added {} LiDAR undistortion factors", num_lidar_factors);
-            }
         }
         
         UNICALIB_INFO("[Phase3] Total {} residual blocks added", num_residuals);
@@ -654,7 +676,7 @@ void JointCalibSolver::phase3_joint_refine(
         
         std::vector<Sophus::SE3d> optimized_poses;
         for (int i = 0; i < num_knots; ++i) {
-            optimized_poses.push_back(spline.knots_h[i]);
+            optimized_poses.push_back(spline.getKnot(i));
         }
         
         UNICALIB_INFO("[Phase3] Extracted {} optimized poses", 
@@ -688,15 +710,22 @@ void JointCalibSolver::phase3_joint_refine(
         
         UNICALIB_INFO("[Phase3] B-spline refinement completed successfully");
         report_progress("Phase3-Refine", 1.0, "完成");
-        
-    } catch (const std::exception& e) {
-        UNICALIB_ERROR("[Phase3] B-spline refinement failed: {}", e.what());
+
+    }
+    catch (const ns_unicalib::UniCalibException& e) {
+        UNICALIB_ERROR("[Phase3] B-spline refinement failed: {}", e.toString());
         summary.success = false;
-        summary.error_message = std::string("Phase3 failed: ") + e.what();
+        summary.error_message = e.toString();
+        // 降级：保留 Phase2 结果
+    }
+    catch (const ns_ikalibr::IKalibrStatus& e) {
+        UNICALIB_ERROR("[Phase3] iKalibr B-spline refinement failed: {}", e.what());
+        summary.success = false;
+        summary.error_message = std::string("iKalibr error: ") + e.what();
         // 降级：保留 Phase2 结果
     }
 
-#else
+#else  // UNICALIB_WITH_IKALIBR
     // 无 iKalibr 时，直接返回成功（使用 Phase2 结果）
     UNICALIB_WARN("[Phase3] Skipped (UNICALIB_WITH_IKALIBR not enabled)");
     UNICALIB_WARN("[Phase3] Using Phase2 coarse extrinsic results");
@@ -713,40 +742,16 @@ void JointCalibSolver::phase3_joint_refine(
 
 #endif  // UNICALIB_WITH_IKALIBR
 }
-        });
-        
-        UNICALIB_INFO("[Phase3] B样条联合精化完成");
-        report_progress("Phase3-Refine", 1.0, "完成");
-
-    } catch (const ns_ikalibr::IKalibrStatus& status) {
-        UNICALIB_ERROR("[Phase3] iKalibr 异常: {}", status.what());
-        summary.success = false;
-        summary.error_message = std::string("Phase3 iKalibr 异常: ") + status.what();
-        report_progress("Phase3-Refine", 1.0, "失败");
-    } catch (const std::exception& e) {
-        UNICALIB_ERROR("[Phase3] B样条精化异常: {}", e.what());
-        summary.success = false;
-        summary.error_message = std::string("Phase3 异常: ") + e.what();
-        report_progress("Phase3-Refine", 1.0, "失败");
-    }
-#else
-    // 非 iKalibr 模式下的占位实现
-    UNICALIB_WARN("[Phase3] UNICALIB_WITH_IKALIBR 未启用，跳过 B样条精化");
-    UNICALIB_INFO("  使用 Phase2 粗外参作为最终结果");
-    summary.success = true;
-    report_progress("Phase3-Refine", 1.0, "完成(跳过)");
-#endif  // UNICALIB_WITH_IKALIBR
-}
 
 void JointCalibSolver::phase4_validation(
-    const CalibDataBundle& /*data*/, CalibSummary& summary) {
+    const ns_unicalib::CalibDataBundle& /*data*/, ns_unicalib::CalibSummary& summary) {
 
     report_progress("Phase4-Validation", 0.0, "验证");
     params_->print_summary();
     report_progress("Phase4-Validation", 1.0, "完成");
 }
 
-void JointCalibSolver::save_results(const CalibSummary& summary) {
+void JointCalibSolver::save_results(const ns_unicalib::CalibSummary& summary) {
     if (!summary.params) return;
 
     fs::create_directories(cfg_.output_dir);

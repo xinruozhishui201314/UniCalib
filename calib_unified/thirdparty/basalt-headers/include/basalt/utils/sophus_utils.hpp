@@ -47,6 +47,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace Sophus {
 
+// 与 ctraj_basalt_compat 的 sophus_utils 二选一，避免 ODR 重定义
+#ifndef UNICALIB_SOPHUS_UTILS_DECOUPLED_DEFINED
+#define UNICALIB_SOPHUS_UTILS_DECOUPLED_DEFINED
+
 /// @brief Decoupled version of logmap for SE(3)
 ///
 /// For SE(3) element vector
@@ -136,6 +140,8 @@ inline Sim3<typename Derived::Scalar> sim3_expd(
       RxSO3<Scalar>::exp(upsilon_omega_sigma.template tail<4>()),
       upsilon_omega_sigma.template head<3>());
 }
+
+#endif  // UNICALIB_SOPHUS_UTILS_DECOUPLED_DEFINED
 
 // Note on the use of const_cast in the following functions: The output
 // parameter is only marked 'const' to make the C++ compiler accept a temporary

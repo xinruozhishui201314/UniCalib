@@ -11,6 +11,10 @@
 /* tiny-viewer removed */
 #include <cereal/cereal.hpp>
 
+// 与 basalt-headers 的 sophus_utils 二选一，避免 ODR 重定义（先包含者生效）
+#ifndef UNICALIB_SOPHUS_UTILS_DECOUPLED_DEFINED
+#define UNICALIB_SOPHUS_UTILS_DECOUPLED_DEFINED
+
 namespace Sophus {
     template<class Archive, typename ScaleTypes>
     void serialize(Archive &archive, Sophus::SO3<ScaleTypes> &m) {
@@ -124,6 +128,13 @@ namespace Sophus {
                 RxSO3<Scalar>::exp(upsilon_omega_sigma.template tail<4>()), upsilon_omega_sigma.template head<3>()
         );
     }
+
+#endif  // UNICALIB_SOPHUS_UTILS_DECOUPLED_DEFINED
+
+}  // namespace Sophus
+
+
+namespace Sophus {
 
     // Note on the use of const_cast in the following functions: The output
     // parameter is only marked 'const' to make the C++ compiler accept a temporary

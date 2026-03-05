@@ -22,6 +22,23 @@
 
 namespace ns_unicalib {
 
+// 尺度约束代价函数（需在命名空间/文件作用域，Ceres 局部类不能有 template 成员）
+struct ScaleConstraintCost {
+    double target_scale, weight;
+    ScaleConstraintCost(double s, double w) : target_scale(s), weight(w) {}
+    template <typename T>
+    bool operator()(const T* const pose, T* residual) const {
+        T tx = pose[3], ty = pose[4], tz = pose[5];
+        T translation_norm = ceres::sqrt(tx*tx + ty*ty + tz*tz);
+        residual[0] = T(weight) * (translation_norm - T(target_scale));
+        return true;
+    }
+    static ceres::CostFunction* Create(double target_scale, double weight) {
+        return new ceres::AutoDiffCostFunction<ScaleConstraintCost, 1, 6>(
+            new ScaleConstraintCost(target_scale, weight));
+    }
+};
+
 // ===================================================================
 // 特征点提取与匹配
 // ===================================================================
@@ -423,26 +440,6 @@ ExtrinsicSE3 CamCamCalibrator::bundle_adjustment_two_views(
         // 通过已知距离消除尺度不确定性
         // 约束: ||t|| = known_baseline_scale (已知的基线长度)
         if (cfg_.enable_scale_constraint && cfg_.known_baseline_scale > 0.001) {
-            // 尺度约束代价函数: (||t|| - scale_target)^2 * weight
-            struct ScaleConstraintCost {
-                double target_scale, weight;
-                ScaleConstraintCost(double s, double w) : target_scale(s), weight(w) {}
-                
-                template <typename T>
-                bool operator()(const T* const pose, T* residual) const {
-                    // 平移向量: pose[3], pose[4], pose[5]
-                    T tx = pose[3], ty = pose[4], tz = pose[5];
-                    T translation_norm = ceres::sqrt(tx*tx + ty*ty + tz*tz);
-                    residual[0] = T(weight) * (translation_norm - T(target_scale));
-                    return true;
-                }
-                
-                static ceres::CostFunction* Create(double target_scale, double weight) {
-                    return new ceres::AutoDiffCostFunction<ScaleConstraintCost, 1, 6>(
-                        new ScaleConstraintCost(target_scale, weight));
-                }
-            };
-            
             problem.AddResidualBlock(
                 ScaleConstraintCost::Create(cfg_.known_baseline_scale, cfg_.scale_constraint_weight),
                 nullptr, pose);

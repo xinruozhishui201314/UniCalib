@@ -21,6 +21,12 @@
 
 #include "unicalib/common/calib_param.h"
 #include "unicalib/common/sensor_types.h"
+#include "unicalib/common/status.h"
+#include "unicalib/common/exception.h"
+#include "unicalib/common/logger.h"
+#include "unicalib/common/timing.h"
+#include "unicalib/common/health_monitor.h"
+#include "unicalib/common/diagnostics.h"
 #include "unicalib/intrinsic/imu_intrinsic_calib.h"
 #include "unicalib/intrinsic/camera_calib.h"
 #include "unicalib/extrinsic/imu_lidar_calib.h"
@@ -31,6 +37,8 @@
 #include <string>
 #include <map>
 #include <any>
+#include <fmt/core.h>
+#include <fmt/format.h>
 
 namespace ns_unicalib {
 
@@ -55,6 +63,7 @@ struct CalibDataBundle {
 // ===================================================================
 struct CalibSummary {
     bool success = false;
+    ErrorCode error_code = ErrorCode::SUCCESS;
     std::string error_message;
     CalibParamManager::Ptr params;
 
@@ -65,16 +74,36 @@ struct CalibSummary {
         double max_error = 0.0;
         bool   converged = false;
         std::string unit;   // "px", "m", "deg", etc.
+        size_t num_samples = 0;
+        double duration_ms = 0.0;  // 执行耗时
     };
     std::vector<QualityMetrics> quality;
+
+    // 整体性能统计
+    double total_duration_ms = 0.0;
+    std::map<std::string, double> phase_durations_ms;
 
     // 输出文件路径
     std::string yaml_path;
     std::string json_path;
     std::string report_html_path;
+    std::string diagnostics_path;
+
+    // 健康状态
+    HealthStatus overall_health = HealthStatus::HEALTHY;
+    std::map<std::string, HealthStatus> module_health;
 
     // 打印摘要
     void print() const;
+    
+    // 转换为 Status
+    Status toStatus() const {
+        if (success) {
+            return Status::OK();
+        } else {
+            return Status::Error(error_code, error_message);
+        }
+    }
 };
 
 // ===================================================================
@@ -129,8 +158,8 @@ public:
                                const std::string& target_id,
                                const Sophus::SE3d& T_init);
 
-    // 主标定函数
-    CalibSummary calibrate(const CalibDataBundle& data);
+    // 主标定函数 (使用新的Status返回)
+    Status calibrate(const CalibDataBundle& data, CalibSummary& summary);
 
     // 独立标定接口
     std::optional<IMUIntrinsics> calibrate_imu_intrinsic(
@@ -172,7 +201,7 @@ public:
     // 获取当前标定参数 (可在标定过程中查询)
     CalibParamManager::Ptr get_params() const { return params_; }
 
-#ifdef UNICALIB_WITH_IKALIBR
+#if UNICALIB_WITH_IKALIBR
     // Phase3 辅助: iKalibr 参数回写
     // 用于将 iKalibr 优化结果写回 params_
     struct iKalibrResultWriter {

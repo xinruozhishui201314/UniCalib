@@ -157,7 +157,9 @@ void CalibPipeline::setup_stage_logger(const std::string& log_path) {
         logger->set_level(spdlog::level::trace);
         spdlog::set_default_logger(logger);
     } catch (const std::exception& e) {
+        // 日志创建失败不应中断流程，使用 WARN 级别
         UNICALIB_WARN("创建阶段日志失败: {}", e.what());
+        // 继续执行，将使用默认日志
     }
 }
 

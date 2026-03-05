@@ -1,9 +1,14 @@
 /**
  * UniCalib — 标定参数管理器实现
+ *
+ * 工程化改造:
+ *   - 使用统一的异常体系
+ *   - 改造 YAML 加载异常处理
  */
 
 #include "unicalib/common/calib_param.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include "unicalib/common/sensor_types.h"
 #include <yaml-cpp/yaml.h>
 #include <fstream>
@@ -161,6 +166,10 @@ void CalibParamManager::save_yaml(const std::string& path) const {
     out << YAML::EndMap;
 
     std::ofstream f(path);
+    if (!f.is_open()) {
+        UNICALIB_THROW_DATA(ErrorCode::FILE_WRITE_ERROR,
+                           "无法打开文件写入标定参数: " + path);
+    }
     f << out.c_str();
     UNICALIB_INFO("CalibParams saved to: {}", path);
 }
@@ -207,8 +216,15 @@ void CalibParamManager::load_yaml(const std::string& path) {
             }
         }
         UNICALIB_INFO("  加载了 {} 个外参", extrinsics.size());
+
+    } catch (const YAML::Exception& e) {
+        UNICALIB_THROW_DATA(ErrorCode::DATA_PARSE_ERROR,
+                            "load_yaml YAML 解析失败: " + path + "\n" + e.what());
+    } catch (const UniCalibException&) {
+        throw;
     } catch (const std::exception& e) {
-        UNICALIB_ERROR("load_yaml 失败: {}", e.what());
+        UNICALIB_THROW_DATA(ErrorCode::DATA_PARSE_ERROR,
+                            "load_yaml 失败: " + std::string(e.what()));
     }
 }
 

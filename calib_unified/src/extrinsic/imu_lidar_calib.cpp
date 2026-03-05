@@ -540,8 +540,8 @@ std::optional<Eigen::Vector3d> IMULiDARCalibrator::estimate_translation(
         }
         
         Constraint c;
-        c.omega = avg_gyro
-        c.vel_diff = v_imu - R * v_lidar
+        c.omega = avg_gyro;
+        c.vel_diff = v_imu - R * v_lidar;
         c.residual_norm = 0.0;      // 后续计算
         constraints.push_back(c);
     }

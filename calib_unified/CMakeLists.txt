@@ -183,10 +183,14 @@ message(STATUS "  • Features: Se3Spline, So3Spline, RdSpline, CeresHelper")
 
 # ---------------------------------------------------------------------------
 # 第三方库: Pangolin 0.9.0 (C++ 可视化, 替代 tiny-viewer)
-# 从 thirdparty/Pangolin/Pangolin-0.9.0 源码编译
+# 仅使用本地路径通过 add_subdirectory 参与编译，不使用 find_package(Pangolin)
+# 默认: thirdparty/Pangolin/Pangolin-0.9.0；可覆盖: -DPANGOLIN_SOURCE_DIR=/path/to/Pangolin
 # ---------------------------------------------------------------------------
-set(PANGOLIN_SOURCE_DIR
-    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/Pangolin/Pangolin-0.9.0)
+if(NOT DEFINED PANGOLIN_SOURCE_DIR)
+  set(PANGOLIN_SOURCE_DIR
+      ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/Pangolin/Pangolin-0.9.0
+      CACHE PATH "Pangolin 源码目录，用于 add_subdirectory 编译")
+endif()
 if(EXISTS ${PANGOLIN_SOURCE_DIR}/CMakeLists.txt)
   set(BUILD_EXAMPLES    OFF CACHE BOOL "Pangolin: disable examples"    FORCE)
   set(BUILD_TOOLS       OFF CACHE BOOL "Pangolin: disable tools"       FORCE)
@@ -259,6 +263,23 @@ if(NOT spdlog_FOUND)
   FetchContent_MakeAvailable(spdlog)
 else()
   message(STATUS "spdlog: ${spdlog_VERSION}")
+endif()
+
+# ---------------------------------------------------------------------------
+# 系统依赖: fmt (用于格式化）
+# ---------------------------------------------------------------------------
+find_package(fmt QUIET)
+if(NOT fmt_FOUND)
+  message(STATUS "fmt not found via find_package, using FetchContent")
+  include(FetchContent)
+  FetchContent_Declare(fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+    GIT_TAG        10.2.1
+    GIT_SHALLOW    TRUE)
+  FetchContent_MakeAvailable(fmt)
+  set(FMT_LIBRARIES fmt::fmt)
+else()
+  message(STATUS "fmt: ${fmt_VERSION}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -378,16 +399,23 @@ elseif(EXISTS "${OPENGV_INSTALL_DIR}/include/opengv/types.hpp")
     message(WARNING "opengv: headers found but library not found; link may fail")
   endif()
 else()
-  # Fall back to bundled opengv headers (copied from iKalibr prebuilt, header-only mode)
+  # Fall back to bundled opengv headers: opengv-stub 或 thirdparty/opengv
   set(_OPENGV_STUB ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/opengv-stub)
+  set(_OPENGV_BUNDLED ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/opengv/include)
   if(EXISTS "${_OPENGV_STUB}/opengv/types.hpp")
     message(STATUS "opengv: using bundled headers at ${_OPENGV_STUB}")
     add_compile_definitions(UNICALIB_WITH_OPENGV=1)
     include_directories(BEFORE ${_OPENGV_STUB})
-    # opengv in header-only mode (no .so needed for the SAC template classes)
     add_library(opengv INTERFACE IMPORTED GLOBAL)
     set_target_properties(opengv PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${_OPENGV_STUB}")
+  elseif(EXISTS "${_OPENGV_BUNDLED}/opengv/types.hpp")
+    message(STATUS "opengv: using thirdparty/opengv at ${_OPENGV_BUNDLED}")
+    add_compile_definitions(UNICALIB_WITH_OPENGV=1)
+    include_directories(BEFORE ${_OPENGV_BUNDLED})
+    add_library(opengv INTERFACE IMPORTED GLOBAL)
+    set_target_properties(opengv PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${_OPENGV_BUNDLED}")
   else()
     message(STATUS "opengv: not found, disabling opengv-dependent features")
     add_compile_definitions(UNICALIB_NO_OPENGV=1)
@@ -513,6 +541,8 @@ set(UNICALIB_NEW_SOURCES
     src/viz/calib_visualizer.cpp
     # I/O
     src/io/yaml_io.cpp
+    # 工程化基础设施（header-only, 部分cpp实现）
+    src/common/calib_param.cpp  # 确保包含
 )
 
 # 最小 iKalibr 依赖：供 IMU-LiDAR 外参标定使用 (LiDAROdometer / LiDARFrame / _1_)
@@ -559,9 +589,9 @@ set(_VIEWER_BACKEND "NONE")
 if(UNICALIB_WITH_PANGOLIN)
     # Pangolin 优先级最高（本地库，无额外依赖）
     
-    # Pangolin 已在行 155-180 配置好
-    if(NOT TARGET pangolin)
-        message(FATAL_ERROR "Pangolin target not found. Check CMakeLists.txt around line 155")
+    # Pangolin 0.9 为组件化：无 pangolin 单 target，使用 pango_display（display/OpenGL 入口）
+    if(NOT TARGET pango_display)
+        message(FATAL_ERROR "Pangolin target pango_display not found. Check CMakeLists.txt around line 155")
     endif()
     
     # 添加 viewer 实现
@@ -685,9 +715,9 @@ if(UNICALIB_WITH_IKALIBR)
     target_link_libraries(unicalib PUBLIC Ceres::ceres)
 endif()
 
-# Pangolin 可视化依赖
+# Pangolin 可视化依赖（0.9 使用组件 target pango_display）
 if(UNICALIB_WITH_PANGOLIN AND _VIEWER_BACKEND STREQUAL "PANGOLIN")
-    target_link_libraries(unicalib PUBLIC pangolin)
+    target_link_libraries(unicalib PUBLIC pango_display)
 endif()
 
 # RViz 可视化依赖
@@ -766,8 +796,9 @@ target_link_libraries(unicalib PUBLIC
     ${PCL_LIBRARIES}
     # 序列化 & 配置
     yaml-cpp
-    # 日志
+    # 日志 & 格式化
     spdlog::spdlog
+    ${FMT_LIBRARIES}
     # 枚举
     magic_enum::magic_enum
     # filesystem (GCC < 9 需要显式链接)
@@ -905,6 +936,8 @@ message(STATUS "  Eigen3:        ${EIGEN3_VERSION_STRING}")
 message(STATUS "  OpenCV:        ${OpenCV_VERSION}")
 message(STATUS "  PCL:           ${PCL_VERSION}")
 message(STATUS "  Ceres:         ${CERES_VERSION}")
+message(STATUS "  spdlog:        ${spdlog_VERSION}")
+message(STATUS "  fmt:           ${fmt_VERSION}")
 message(STATUS "  OpenMP:        ${OpenMP_CXX_FOUND}")
 message(STATUS "  opengv:        bundled headers (${_OPENGV_STUB})")
 message(STATUS "  ufomap:        ${ufomap_FOUND}")

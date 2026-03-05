@@ -14,13 +14,13 @@
 
 #include "unicalib/pipeline/ai_coarse_calib.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <cstdio>
 #include <chrono>
-#include <stdexcept>
 #include <thread>
 #include <yaml-cpp/yaml.h>
 #include <unistd.h>
@@ -127,7 +127,10 @@ static std::string serialize_imu_to_yaml(
     const std::vector<IMUFrame>& data, const std::string& path) {
 
     std::ofstream f(path);
-    if (!f.is_open()) throw std::runtime_error("Cannot write " + path);
+    if (!f.is_open()) {
+        UNICALIB_THROW_DATA(ErrorCode::FILE_WRITE_ERROR, 
+                           "无法写入 IMU 数据文件: " + path);
+    }
 
     f << "num_samples: " << data.size() << "\n";
     f << "imu_data:\n";

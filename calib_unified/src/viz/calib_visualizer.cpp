@@ -6,21 +6,21 @@
  *   2. LiDAR-Camera 投影验证 (边缘对齐、互信息)
  *   3. 通用可视化 (收敛曲线、时间偏移图、误差分布)
  *   4. Pangolin 3D 可视化（交互式显示）
+ *
+ * 工程化改造: 使用统一的异常体系
  */
 
 #include "unicalib/viz/calib_visualizer.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
+#include "unicalib/common/error_code.h"
 #include <opencv2/opencv.hpp>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
 #include <numeric>
-
-#ifdef UNICALIB_WITH_PANGOLIN
-#include <pangolin/pangolin.h>
-#include <pangolin/plot/plotter.h>
-#include <pangolin/gl/gldraw.h>
-#endif  // UNICALIB_WITH_PANGOLIN
+#include <pcl/point_cloud.h>
+#include <pcl/common/transforms.h>
 
 namespace fs = std::filesystem;
 
@@ -57,6 +57,18 @@ CalibVisualizer::~CalibVisualizer() {
 }
 
 // ===========================================================================
+// 进度报告
+// ===========================================================================
+void CalibVisualizer::report_progress(const std::string& stage,
+                                       const std::string& step,
+                                       double progress,
+                                       const std::string& message) {
+    if (progress_cb_) {
+        progress_cb_(stage, step, progress, message);
+    }
+}
+
+// ===========================================================================
 // 3D 可视化接口
 // ===========================================================================
 CloudViewer::Ptr CalibVisualizer::get_cloud_viewer() {
@@ -86,7 +98,7 @@ void CalibVisualizer::show_imu_lidar_result(const IMULiDARVizData& data, bool bl
             poses_se3.push_back(p.second);
         cloud_viewer_->add_trajectory(poses_se3, "lidar_odom", config_.lidar_trajectory_color, 3.0f);
         for (size_t i = 0; i < data.lidar_odom_poses.size(); i += 10) {
-            cloud_viewer_->add_coordinate_system(data.lidar_odom_poses[i].second, "odom_" + std::to_string(i), 0.3f);
+            cloud_viewer_->add_coordinate_frame(data.lidar_odom_poses[i].second, "odom_" + std::to_string(i), 0.3f);
         }
     }
 
@@ -103,8 +115,8 @@ void CalibVisualizer::show_imu_lidar_result(const IMULiDARVizData& data, bool bl
     // 4. 显示最终外参坐标系
     if (data.coarse_result.has_value() || data.fine_result.has_value()) {
         const auto& result = data.fine_result.has_value() ? data.fine_result : data.coarse_result;
-        cloud_viewer_->add_coordinate_system(Sophus::SE3d(result->SO3_TargetInRef, result->POS_TargetInRef),
-                                              "extrinsic_final", 0.5f);
+        cloud_viewer_->add_coordinate_frame(Sophus::SE3d(result->SO3_TargetInRef, result->POS_TargetInRef),
+                                            "extrinsic_final", 0.5f);
     }
 
     // 5. 保存可视化
@@ -139,13 +151,12 @@ void CalibVisualizer::show_rotation_pairs(const std::vector<IMULiDARVizData::Rot
 
         // IMU 旋转轴 (红色)
         Eigen::Vector3d axis_imu(1, 0, 0);
-        cloud_viewer_->add_coordinate_system(Sophus::SE3d(pair.rot_imu, Sophus::SO3d::exp(axis_imu * 0.2)),
+        cloud_viewer_->add_coordinate_frame(Sophus::SE3d(pair.rot_imu, axis_imu * 0.2),
                                              "imu_axis_" + std::to_string(i), 0.2f);
 
         // LiDAR 旋转轴 (蓝色)
         Eigen::Vector3d axis_lidar(1, 0, 0);
-        Sophus::SE3d T_imu_lidar(pair.rot_lidar * pair.rot_imu.inverse(), Eigen::Vector3d::Zero());
-        cloud_viewer_->add_coordinate_system(Sophus::SE3d(pair.rot_lidar, Sophus::SO3d::exp(axis_lidar * 0.2)),
+        cloud_viewer_->add_coordinate_frame(Sophus::SE3d(pair.rot_lidar, axis_lidar * 0.2),
                                              "lidar_axis_" + std::to_string(i), 0.2f);
     }
 
@@ -164,158 +175,40 @@ void CalibVisualizer::show_lidar_odometry(const std::vector<Sophus::SE3d>& poses
 
     // 添加坐标轴
     for (size_t i = 0; i < poses.size(); i += 5) {
-        cloud_viewer_->add_coordinate_system(poses[i], "odom_" + std::to_string(i), 0.5f);
+        cloud_viewer_->add_coordinate_frame(poses[i], "odom_" + std::to_string(i), 0.5f);
     }
 
     save_plots(config_.screenshot_dir + "/lidar_odom");
 }
 
 void CalibVisualizer::show_bspline_optimization(const std::vector<IMULiDARVizData::OptimizationLog>& history, bool show_animation) {
-#ifdef UNICALIB_WITH_PANGOLIN
+    (void)show_animation;
     if (history.empty()) return;
 
-    try {
-        // ───────────────────────────────────────────────────────────
-        // 创建 Pangolin 窗口
-        // ───────────────────────────────────────────────────────────
-        std::string window_name = "UniCalib - B-spline Optimization";
-        pangolin::CreateWindowAndBind(window_name, 1400, 900);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        // 3D 视图配置
-        pangolin::OpenGlRenderState s_cam(
-            pangolin::ProjectionMatrix(1400, 600, 500, 500, 700, 300, 0.1, 1000),
-            pangolin::ModelViewLookAt(0, -5, -3, 0, 0, 0, pangolin::AxisZ));
-        
-        pangolin::View& d_cam = pangolin::CreateDisplay()
-            .SetBounds(0.0, 1.0, 0.0, 0.65)
-            .SetHandler(new pangolin::Handler3D(s_cam));
-
-        // 图表窗口
-        pangolin::View& d_plot = pangolin::CreateDisplay()
-            .SetBounds(0.0, 1.0, 0.65, 1.0);
-
-        // ───────────────────────────────────────────────────────────
-        // 渲染循环
-        // ───────────────────────────────────────────────────────────
-        while (!pangolin::ShouldQuit()) {
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-            // 3D 场景
-            d_cam.Activate(s_cam);
-            glEnable(GL_DEPTH_TEST);
-            glColorMask(true, true, true, true);
-
-            // 绘制坐标系
-            pangolin::glDrawCoordinateFrame(1.0);
-
-            // 可视化轨迹点（如果有可用的位姿信息）
-            glPointSize(2.0f);
-            glBegin(GL_POINTS);
-            glColor3f(0, 1, 0);  // 绿色
-            for (const auto& log : history) {
-                // 这里可扩展显示轨迹
-            }
-            glEnd();
-
-            // 收敛曲线窗口
-            d_plot.Activate();
-            
-            // 提取优化数据
-            std::vector<double> iterations;
-            std::vector<double> costs;
-            
-            for (size_t i = 0; i < history.size(); ++i) {
-                iterations.push_back(static_cast<double>(i));
-                costs.push_back(history[i].cost);
-            }
-
-            // 绘制收敛曲线
-            if (!costs.empty()) {
-                double max_cost = *std::max_element(costs.begin(), costs.end());
-                double min_cost = *std::min_element(costs.begin(), costs.end());
-                
-                glClear(GL_COLOR_BUFFER_BIT);
-                glMatrixMode(GL_PROJECTION);
-                glPushMatrix();
-                glLoadIdentity();
-                glOrtho(0, iterations.size(), min_cost * 0.9, max_cost * 1.1, -1, 1);
-                glMatrixMode(GL_MODELVIEW);
-                glPushMatrix();
-                glLoadIdentity();
-
-                // 绘制网格
-                glColor3f(0.3f, 0.3f, 0.3f);
-                glBegin(GL_LINES);
-                for (int i = 0; i <= 10; ++i) {
-                    double y = min_cost + (max_cost - min_cost) * i / 10.0;
-                    glVertex2f(0, y);
-                    glVertex2f(iterations.size(), y);
-                }
-                glEnd();
-
-                // 绘制曲线
-                glColor3f(1, 0, 0);
-                glLineWidth(2.0f);
-                glBegin(GL_LINE_STRIP);
-                for (size_t i = 0; i < costs.size(); ++i) {
-                    glVertex2f(i, costs[i]);
-                }
-                glEnd();
-
-                // 恢复投影
-                glPopMatrix();
-                glMatrixMode(GL_PROJECTION);
-                glPopMatrix();
-                glMatrixMode(GL_MODELVIEW);
-            }
-
-            pangolin::FinishFrame();
-
-            if (!show_animation) break;
-        }
-
-        UNICALIB_INFO("[CalibVisualizer] B-spline optimization visualization completed");
-
-    } catch (const std::exception& e) {
-        UNICALIB_ERROR("[CalibVisualizer] Pangolin visualization error: {}", e.what());
-    }
-
-#else
-    // 无 Pangolin 时，输出到文件
-    UNICALIB_WARN("[CalibVisualizer] Pangolin not available, using OpenCV visualization");
-    
-    if (cloud_viewer_ || history.empty()) return;
-
-    // 提取收敛数据
     std::vector<double> iterations;
     std::vector<double> costs;
     std::vector<double> time_offsets;
-
-    for (const auto& log : history) {
-        iterations.push_back(static_cast<double>(log.iterations.size()));
-        costs.push_back(log.cost);
-        for (const auto& ts : log.time_offsets) {
+    for (size_t i = 0; i < history.size(); ++i) {
+        iterations.push_back(static_cast<double>(i));
+        costs.push_back(history[i].cost);
+        for (const auto& ts : history[i].time_offsets) {
             time_offsets.push_back(ts);
         }
     }
 
-    // 绘制收敛曲线（OpenCV 版本）
     cv::Mat conv_curve = draw_optimization_convergence_curve(iterations, costs, "B-spline Optimization",
                                                               config_.plot_width, config_.plot_height);
     save_plots(config_.screenshot_dir + "/bspline_convergence");
 
-    // 绘制时间偏移曲线
-    if (!time_offsets.empty()) {
+    if (!time_offsets.empty() && time_offsets.size() == costs.size()) {
         cv::Mat time_curve = plot_time_offset_convergence_curve(time_offsets, costs, "Time Offset Estimation");
+        (void)time_curve;
         save_plots(config_.screenshot_dir + "/time_offset");
     }
 
-    if (show_animation && cloud_viewer_) {
+    if (cloud_viewer_) {
         cloud_viewer_->spin_once(100);
     }
-
-#endif  // UNICALIB_WITH_PANGOLIN
 }
 
 // ===========================================================================
@@ -371,7 +264,9 @@ void CalibVisualizer::show_image_alignment(const std::vector<CameraFrame>& camer
         // 绘制角点重投影
         std::vector<Eigen::Vector2d> corners_2d;
         std::vector<Eigen::Vector2d> corners_reprojected;
-        // TODO: 根据实际数据填充
+        // 注意: 实际角点检测应在标定阶段完成
+        // 这里仅提供可视化框架，实际数据需从标定结果中传入
+        UNICALIB_DEBUG("[CalibVisualizer] 角点重投影可视化 (当前为空)");
 
         cv::Mat alignment_img = draw_camera_reprojection_errors(corners_2d, corners_reprojected,
                                                                   "Image Alignment");
@@ -411,8 +306,8 @@ void CalibVisualizer::show_cloud_alignment(const std::vector<LiDARScan>& scans_b
     }
 
     // 添加坐标系
-    cloud_viewer_->add_coordinate_system(Sophus::SE3d(), "imu_origin", 0.5f);
-    cloud_viewer_->add_coordinate_system(extrinsic, "extrinsic_frame", 0.5f);
+    cloud_viewer_->add_coordinate_frame(Sophus::SE3d(), "imu_origin", 0.5f);
+    cloud_viewer_->add_coordinate_frame(extrinsic.SE3_TargetInRef(), "extrinsic_frame", 0.5f);
 
     cloud_viewer_->spin_once(100);
 
@@ -485,8 +380,8 @@ cv::Mat CalibVisualizer::draw_optimization_convergence_curve(const std::vector<d
     cv::line(img, cv::Point(margin, H - margin), cv::Point(W - margin, H - margin), cv::Scalar(0, 0, 0), 1);
 
     // 轴标签
-    cv::putText("Iteration", cv::Point(W / 2 - 40, H - margin + 20), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
-    cv::putText("Cost", cv::Point(margin - 5, margin + 20), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
+    cv::putText(img, "Iteration", cv::Point(W / 2 - 40, H - margin + 20), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
+    cv::putText(img, "Cost", cv::Point(margin - 5, margin + 20), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
 
     // 绘制曲线
     double cost_range = max_cost - min_cost;
@@ -504,14 +399,34 @@ cv::Mat CalibVisualizer::draw_optimization_convergence_curve(const std::vector<d
     return img;
 }
 
+cv::Mat CalibVisualizer::draw_camera_reprojection_errors(
+    const std::vector<Eigen::Vector2d>& corners_2d,
+    const std::vector<Eigen::Vector2d>& corners_reprojected,
+    const std::string& title) {
+    const int W = config_.plot_width;
+    const int H = config_.plot_height;
+    cv::Mat img(H, W, CV_8UC3, cv::Scalar(255, 255, 255));
+    if (corners_2d.empty() && corners_reprojected.empty()) {
+        cv::putText(img, title, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 2);
+        return img;
+    }
+    for (const auto& p : corners_2d)
+        cv::circle(img, cv::Point(static_cast<int>(p.x()), static_cast<int>(p.y())), 3, cv::Scalar(0, 0, 255), -1);
+    for (const auto& p : corners_reprojected)
+        cv::circle(img, cv::Point(static_cast<int>(p.x()), static_cast<int>(p.y())), 2, cv::Scalar(0, 255, 0), -1);
+    cv::putText(img, title, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 2);
+    return img;
+}
+
 cv::Mat CalibVisualizer::plot_time_offset_convergence_curve(const std::vector<double>& time_offsets,
                                                              const std::vector<double>& costs,
                                                              const std::string& title) {
     if (time_offsets.empty() || costs.empty()) return cv::Mat();
 
-    std::sort(time_offsets.begin(), time_offsets.end());
-    double min_time_offset = time_offsets.front();
-    double max_time_offset = time_offsets.back();
+    std::vector<double> sorted_offsets = time_offsets;
+    std::sort(sorted_offsets.begin(), sorted_offsets.end());
+    double min_time_offset = sorted_offsets.front();
+    double max_time_offset = sorted_offsets.back();
 
     const int W = config_.plot_width;
     const int H = config_.plot_height;
@@ -526,8 +441,8 @@ cv::Mat CalibVisualizer::plot_time_offset_convergence_curve(const std::vector<do
     cv::line(img, cv::Point(margin, H - margin), cv::Point(W - margin, H - margin), cv::Scalar(0, 0, 0), 1);
 
     // 轴标签
-    cv::putText("Time Offset (s)", cv::Point(W / 2 - 50, H - margin + 15), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
-    cv::putText("Cost", cv::Point(margin - 5, margin + 15), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
+    cv::putText(img, "Time Offset (s)", cv::Point(W / 2 - 50, H - margin + 15), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
+    cv::putText(img, "Cost", cv::Point(margin - 5, margin + 15), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
 
     // 绘制数据点
     if (time_offsets.size() != costs.size()) return img;
@@ -555,29 +470,29 @@ cv::Mat CalibVisualizer::draw_imu_lidar_result_summary(const ExtrinsicSE3& coars
     cv::Mat img(H, W, CV_8UC3, cv::Scalar(255, 255, 255));
 
     // 绘制标题
-    cv::putText("IMU-LiDAR Calibration Results", cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 2);
+    cv::putText(img, "IMU-LiDAR Calibration Results", cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 2);
 
     // 计算变化量
     Eigen::Vector3d trans_diff = fine.POS_TargetInRef - coarse.POS_TargetInRef;
     Eigen::Vector3d rpy_diff = fine.euler_deg() - coarse.euler_deg();
 
     // 绘制结果
-    cv::putText("Coarse -> Fine Changes:", cv::Point(10, 70), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
-    cv::putText(cv::format("  Translation: [{:.4f}, {:.4f}, {:.4f}] -> [{:.4f}, {:.4f}, {:.4f}] m",
+    cv::putText(img, "Coarse -> Fine Changes:", cv::Point(10, 70), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
+    cv::putText(img, cv::format("  Translation: [%.4f, %.4f, %.4f] -> [%.4f, %.4f, %.4f] m",
                   trans_diff.x(), trans_diff.y(), trans_diff.z(),
                   fine.POS_TargetInRef.x(), fine.POS_TargetInRef.y(), fine.POS_TargetInRef.z()),
                 cv::Point(10, 100), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
-    cv::putText(cv::format("  Rotation: [{:.4f}, {:.4f}, {:.4f}] -> [{:.4f}, {:.4f}, {:.4f}] deg",
+    cv::putText(img, cv::format("  Rotation: [%.4f, %.4f, %.4f] -> [%.4f, %.4f, %.4f] deg",
                   rpy_diff.x(), rpy_diff.y(), rpy_diff.z(),
                   fine.euler_deg().x(), fine.euler_deg().y(), fine.euler_deg().z()),
                 cv::Point(10, 130), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
-    cv::putText(cv::format("  Time Offset: {:.4f} -> {:.4f} ms",
+    cv::putText(img, cv::format("  Time Offset: %.4f -> %.4f ms",
                   coarse.time_offset_s * 1000, fine.time_offset_s * 1000),
                 cv::Point(10, 160), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 0, 0), 1);
 
     // 绘制误差统计
     if (!rot_errors.empty()) {
-        cv::putText("Rotation Error Distribution", cv::Point(10, 200), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
+        cv::putText(img, "Rotation Error Distribution", cv::Point(10, 200), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
         // 绘制误差柱状图
         double max_err = *std::max_element(rot_errors.begin(), rot_errors.end());
         int margin = 60;
@@ -595,7 +510,7 @@ cv::Mat CalibVisualizer::draw_imu_lidar_result_summary(const ExtrinsicSE3& coars
     }
 
     if (!trans_errors.empty()) {
-        cv::putText("Translation Error Distribution", cv::Point(10, 340), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
+        cv::putText(img, "Translation Error Distribution", cv::Point(10, 340), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
         // 绘制误差柱状图
         double max_err = *std::max_element(trans_errors.begin(), trans_errors.end());
         int margin = 60;
