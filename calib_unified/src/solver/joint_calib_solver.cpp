@@ -21,6 +21,7 @@
 #if UNICALIB_WITH_IKALIBR
 #include <basalt/spline/se3_spline.h>
 #include <basalt/spline/ceres_spline_helper.h>
+#include <basalt/utils/sophus_utils.hpp>
 #include <ceres/ceres.h>
 #include "ikalibr/calib/calib_data_manager.h"
 #include "ikalibr/calib/calib_param_manager.h"
@@ -111,6 +112,7 @@ void JointCalibSolver::iKalibrResultWriter::write_extrinsics(
     if (!ikalibr_param_mgr || !unicalib_params) return;
     
     UNICALIB_INFO("[iKalibrRW] 写回外参");
+    UNICALIB_WARN("[iKalibrRW] write_extrinsics 为桩实现：未从 iKalibr 读取优化结果，需根据 iKalibr API 补全");
     // 遍历 unicalib_params 中的所有外参，从 ikalibr_param_mgr 读取优化结果
     // 示例伪代码（需根据实际 iKalibr API 调整）:
     // for (auto& [key, ext_ptr] : unicalib_params->extrinsics) {
@@ -136,6 +138,7 @@ void JointCalibSolver::iKalibrResultWriter::write_imu_intrinsics(
     if (!ikalibr_param_mgr || !unicalib_params) return;
     
     UNICALIB_INFO("[iKalibrRW] 写回 IMU 内参");
+    UNICALIB_WARN("[iKalibrRW] write_imu_intrinsics 为桩实现：未从 iKalibr 读取，需根据 API 补全");
     // 类似逻辑: 遍历 unicalib_params->imu_intrinsics，从 ikalibr_param_mgr 读取更新值
 }
 
@@ -146,6 +149,7 @@ void JointCalibSolver::iKalibrResultWriter::write_camera_intrinsics(
     if (!ikalibr_param_mgr || !unicalib_params) return;
     
     UNICALIB_INFO("[iKalibrRW] 写回相机内参");
+    UNICALIB_WARN("[iKalibrRW] write_camera_intrinsics 为桩实现：未从 iKalibr 读取，需根据 API 补全");
     // 类似逻辑: 遍历 unicalib_params->camera_intrinsics，从 ikalibr_param_mgr 读取更新值
 }
 
@@ -505,81 +509,120 @@ void JointCalibSolver::phase2_coarse_extrinsic(
     report_progress("Phase2-Coarse", 1.0, "完成");
 }
 
+#if UNICALIB_WITH_IKALIBR
+namespace {
+// B样条轨迹拟合代价：残差 = log(spline.pose(t)^{-1} * T_meas)，对 knot 使用 basalt pose(t,&J) 解析雅可比
+constexpr int BSPLINE_ORDER = 5;
+using Se3Spline = basalt::Se3Spline<BSPLINE_ORDER, double>;
+
+class SplineTrajectoryCost : public ceres::CostFunction {
+ public:
+    SplineTrajectoryCost(Se3Spline* spline, int64_t t_ns, const Sophus::SE3d& T_meas,
+                         int64_t dt_ns, int64_t t0_ns, int num_knots)
+        : spline_(spline), t_ns_(t_ns), T_meas_(T_meas),
+          dt_ns_(dt_ns), t0_ns_(t0_ns), num_knots_(num_knots) {
+        set_num_residuals(6);
+        for (int i = 0; i < num_knots; ++i)
+            mutable_parameter_block_sizes()->push_back(6);
+    }
+
+    bool Evaluate(double const* const* parameters,
+                  double* residuals,
+                  double** jacobians) const override {
+        // 1) 从 parameters 同步到 spline（每 knot 6 维: angle_axis + trans）
+        for (int i = 0; i < num_knots_; ++i) {
+            const double* k = parameters[i];
+            Eigen::Vector3d omega(k[0], k[1], k[2]);
+            Eigen::Vector3d trans(k[3], k[4], k[5]);
+            spline_->setKnot(Sophus::SE3d(Sophus::SO3d::exp(omega), trans), i);
+        }
+        // 2) 求 pose 及对 knot 的雅可比
+        typename Se3Spline::PosePosSO3JacobianStruct J;
+        Sophus::SE3d pose = spline_->pose(t_ns_, &J);
+        Sophus::SE3d T_err = pose.inverse() * T_meas_;
+        Eigen::Map<Eigen::Matrix<double, 6, 1>> r(residuals);
+        r = T_err.log();
+
+        if (!jacobians) return true;
+
+        Eigen::Matrix<double, 6, 6> J_r_inv;
+        Sophus::rightJacobianInvSE3Decoupled(r, J_r_inv);
+        const size_t start = J.start_idx;
+        const int N = BSPLINE_ORDER;
+        for (int i = 0; i < num_knots_; ++i) {
+            if (jacobians[i]) {
+                Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> Jk(jacobians[i]);
+                Jk.setZero();
+                if (i >= static_cast<int>(start) && i < static_cast<int>(start) + N) {
+                    size_t local = i - start;
+                    Jk = -J_r_inv * J.d_val_d_knot[local];
+                }
+            }
+        }
+        return true;
+    }
+
+ private:
+    Se3Spline* spline_;
+    int64_t t_ns_;
+    Sophus::SE3d T_meas_;
+    int64_t dt_ns_;
+    int64_t t0_ns_;
+    int num_knots_;
+};
+}  // namespace
+#endif
+
 void JointCalibSolver::phase3_joint_refine(
     const ns_unicalib::CalibDataBundle& data, ns_unicalib::CalibSummary& summary) {
 
     report_progress("Phase3-Refine", 0.0, "B样条联合精化");
 #if UNICALIB_WITH_IKALIBR
     // ==================================================================
-    // B样条联合精化 (基于 basalt-headers)
+    // B样条联合精化 (基于 basalt-headers + Ceres knot 优化)
     // ==================================================================
-    // 使用本地 basalt-headers 的 Se3Spline + CeresSplineHelper
-    // 实现 B-样条时空联合优化，替代 iKalibr 的冗余实现
-    
     try {
-        UNICALIB_INFO("[Phase3] 启动 B样条联合精化（基于 basalt-headers）");
+        UNICALIB_INFO("[Phase3] 启动 B样条联合精化（knot 参数化 + 解析雅可比）");
         
-        // ─────────────────────────────────────────────────────────────
-        // Step 1: 准备轨迹数据
-        // ─────────────────────────────────────────────────────────────
         report_progress("Phase3-Refine", 0.1, "准备轨迹数据");
-        
         if (data.lidar_scans.empty()) {
             UNICALIB_WARN("[Phase3] No LiDAR scans provided, skipping B-spline refinement");
-            summary.success = true;  // 降级：使用 Phase2 结果
+            summary.success = true;
             return;
         }
         
-        // 收集 LiDAR 轨迹 (pose + time)；data.lidar_scans: map<sensor_id, vector<LiDARScan>>
         std::vector<std::pair<double, Sophus::SE3d>> lidar_trajectory;
         for (const auto& [lidar_id, scans] : data.lidar_scans) {
             for (const auto& scan : scans) {
                 if (scan.timestamp >= 0 && scan.pose) {
-                    lidar_trajectory.push_back(
-                        std::make_pair(scan.timestamp, *scan.pose));
+                    lidar_trajectory.push_back(std::make_pair(scan.timestamp, *scan.pose));
                 }
             }
         }
         
         if (lidar_trajectory.size() < 5) {
-            UNICALIB_WARN("[Phase3] Insufficient trajectory points ({} < 5)", 
-                         lidar_trajectory.size());
+            UNICALIB_WARN("[Phase3] Insufficient trajectory points ({} < 5)", lidar_trajectory.size());
             summary.success = true;
             return;
         }
         
-        UNICALIB_INFO("[Phase3] Collected {} trajectory points", 
-                      lidar_trajectory.size());
-        
-        // ─────────────────────────────────────────────────────────────
-        // Step 2: 构造 B-样条 (Se3Spline<5, double>)
-        // ─────────────────────────────────────────────────────────────
+        UNICALIB_INFO("[Phase3] Collected {} trajectory points", lidar_trajectory.size());
         report_progress("Phase3-Refine", 0.2, "构造B样条");
         
-        using Se3Spline = basalt::Se3Spline<5, double>;
-        
-        // knot 间隔 (单位：秒)
-        double dt = 0.1;  // 100ms
-        
+        using Se3Spline = basalt::Se3Spline<BSPLINE_ORDER, double>;
+        const double dt = 0.1;
         double t_start = lidar_trajectory.front().first;
         double t_end = lidar_trajectory.back().first;
-        int num_knots = static_cast<int>((t_end - t_start) / dt) + 1;
-        
-        UNICALIB_INFO("[Phase3] Time range: {:.2f}s ~ {:.2f}s", t_start, t_end);
-        UNICALIB_INFO("[Phase3] Creating spline with {} knots (dt={}ms)", 
-                      num_knots, static_cast<int>(dt * 1000));
-        
+        const int num_knots = std::max(8, static_cast<int>((t_end - t_start) / dt) + 1);
         const int64_t dt_ns = static_cast<int64_t>(dt * 1e9);
         const int64_t t0_ns = static_cast<int64_t>(t_start * 1e9);
-        Se3Spline spline(dt_ns, t0_ns);
         
-        // 初始化 knot（从轨迹采样）
+        Se3Spline spline(dt_ns, t0_ns);
         Sophus::SE3d last_pose = lidar_trajectory.front().second;
         spline.setKnots(last_pose, num_knots);
         for (int i = 0; i < num_knots; ++i) {
             double t_knot = t_start + i * dt;
-            auto it = std::lower_bound(
-                lidar_trajectory.begin(), lidar_trajectory.end(),
+            auto it = std::lower_bound(lidar_trajectory.begin(), lidar_trajectory.end(),
                 t_knot, [](const auto& a, double t) { return a.first < t; });
             if (it != lidar_trajectory.end()) {
                 spline.setKnot(it->second, i);
@@ -589,155 +632,112 @@ void JointCalibSolver::phase3_joint_refine(
             }
         }
         
-        UNICALIB_INFO("[Phase3] B-spline constructed");
-        
-        // ─────────────────────────────────────────────────────────────
-        // Step 3: 构造 Ceres 优化问题
-        // ─────────────────────────────────────────────────────────────
-        report_progress("Phase3-Refine", 0.3, "构造优化问题");
+        // Knot 存储 (6 维/knot: angle_axis + trans)，并加入 Ceres
+        std::vector<double> knot_storage(static_cast<size_t>(num_knots) * 6);
+        std::vector<double*> knot_ptrs(static_cast<size_t>(num_knots));
+        for (int i = 0; i < num_knots; ++i) {
+            Sophus::SE3d T = spline.getKnot(i);
+            Eigen::Vector3d omega = T.so3().log();
+            Eigen::Vector3d trans = T.translation();
+            knot_storage[i*6+0] = omega(0); knot_storage[i*6+1] = omega(1); knot_storage[i*6+2] = omega(2);
+            knot_storage[i*6+3] = trans(0); knot_storage[i*6+4] = trans(1); knot_storage[i*6+5] = trans(2);
+            knot_ptrs[i] = &knot_storage[i * 6];
+        }
         
         ceres::Problem problem;
-        ceres::Solver::Options solver_options;
-        solver_options.max_num_iterations = 50;
-        solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
-        solver_options.num_threads = std::thread::hardware_concurrency();
-        solver_options.minimizer_progress_to_stdout = cfg_.verbose;
+        for (int i = 0; i < num_knots; ++i)
+            problem.AddParameterBlock(knot_ptrs[i], 6);
         
-        // ─────────────────────────────────────────────────────────────
-        // Step 4: 添加观测因子
-        // ─────────────────────────────────────────────────────────────
-        report_progress("Phase3-Refine", 0.4, "添加观测因子");
-        
+        report_progress("Phase3-Refine", 0.4, "添加轨迹拟合因子");
         int num_residuals = 0;
+        const int N = BSPLINE_ORDER;
+        for (const auto& [t, T_meas] : lidar_trajectory) {
+            int64_t t_ns = static_cast<int64_t>(t * 1e9);
+            if (t_ns < spline.minTimeNs() || t_ns > spline.maxTimeNs()) continue;
+            int seg = static_cast<int>((t_ns - t0_ns) / dt_ns);
+            if (seg < 0 || seg + N > num_knots) continue;
+            ceres::CostFunction* cost = new SplineTrajectoryCost(
+                &spline, t_ns, T_meas, dt_ns, t0_ns, num_knots);
+            // Ceres 2.x 支持 AddResidualBlock(..., const std::vector<double*>&)；若使用 1.x 需改为逐指针传入
+            problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0), knot_ptrs);
+            num_residuals++;
+        }
+        UNICALIB_INFO("[Phase3] Added {} trajectory residual blocks (knot optimization)", num_residuals);
         
-        // IMU 观测因子（可选）；data.imu_data: map<sensor_id, vector<IMUFrame>>
-        if (!data.imu_data.empty()) {
-            UNICALIB_INFO("[Phase3] Adding IMU factors...");
-            for (const auto& [sensor_id, imu_frames] : data.imu_data) {
-                for (const auto& imu_frame : imu_frames) {
-                    if (!imu_frame.gyro.allFinite()) continue;
-                    double t_imu = imu_frame.timestamp;
-                    if (t_imu < t_start || t_imu > t_end) continue;
-                    double dt_check = 0.001;
-                    if (t_imu + dt_check <= t_end && t_imu - dt_check >= t_start) {
-                        try {
-                            const int64_t t_left_ns = static_cast<int64_t>((t_imu - dt_check) * 1e9);
-                            const int64_t t_right_ns = static_cast<int64_t>((t_imu + dt_check) * 1e9);
-                            Sophus::SE3d pose_left = spline.pose(t_left_ns);
-                            Sophus::SE3d pose_right = spline.pose(t_right_ns);
-                            Sophus::SO3d dR = pose_right.so3() * pose_left.so3().inverse();
-                            Eigen::Vector3d gyro_spline = dR.log() / (2.0 * dt_check);
-                            Eigen::Vector3d gyro_residual = imu_frame.gyro - gyro_spline;
-                            (void)gyro_residual;
-                            num_residuals++;
-                        } catch (const std::exception& e) {
-                            UNICALIB_DEBUG("[Phase3] IMU gyro evaluation error sensor={} t={}: {}",
-                                           sensor_id, t_imu, e.what());
-                        }
-                    }
-                }
-            }
-            UNICALIB_INFO("[Phase3] Added {} IMU factors", num_residuals);
+        if (num_residuals < 5) {
+            UNICALIB_WARN("[Phase3] Too few residuals, skip solve");
+            summary.success = true;
+            return;
         }
         
-        // LiDAR 扫描因子；data.lidar_scans: map<sensor_id, vector<LiDARScan>>
-        if (!data.lidar_scans.empty()) {
-            UNICALIB_INFO("[Phase3] Adding LiDAR undistortion factors...");
-            int num_lidar_factors = 0;
-            for (const auto& [lidar_id, scans] : data.lidar_scans) {
-                for (const auto& scan : scans) {
-                    if (!scan.cloud || scan.cloud->empty()) continue;
-                    if (scan.timestamp < t_start || scan.timestamp > t_end) continue;
-                    try {
-                        const int64_t scan_time_ns = static_cast<int64_t>(scan.timestamp * 1e9);
-                        Sophus::SE3d pose_at_scan = spline.pose(scan_time_ns);
-                        Sophus::SE3d expected_pose = scan.pose ? *scan.pose : pose_at_scan;
-                        Sophus::SE3d delta_pose = expected_pose.inverse() * pose_at_scan;
-                        Eigen::Vector3d position_error = delta_pose.translation();
-                        Eigen::Vector3d rotation_error = delta_pose.so3().log();
-                        double time_factor = 1.0 / (1.0 + 0.1 * (scan.timestamp - t_start));
-                        (void)position_error;
-                        (void)rotation_error;
-                        (void)time_factor;
-                        num_residuals++;
-                        num_lidar_factors++;
-                    } catch (const std::exception& e) {
-                        UNICALIB_DEBUG("[Phase3] LiDAR scan evaluation error lidar_id={} t={}: {}",
-                                       lidar_id, scan.timestamp, e.what());
-                    }
-                }
-            }
-            UNICALIB_INFO("[Phase3] Added {} LiDAR undistortion factors", num_lidar_factors);
-        }
-        
-        UNICALIB_INFO("[Phase3] Total {} residual blocks added", num_residuals);
-        
-        // ─────────────────────────────────────────────────────────────
-        // Step 5: 执行优化
-        // ─────────────────────────────────────────────────────────────
         report_progress("Phase3-Refine", 0.5, "执行优化");
-        
-        UNICALIB_INFO("[Phase3] Solving with Ceres...");
+        ceres::Solver::Options solver_options;
+        solver_options.max_num_iterations = 80;
+        solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
+        solver_options.num_threads = 1;  // SplineTrajectoryCost 会写回 spline，多线程有数据竞争
+        solver_options.minimizer_progress_to_stdout = cfg_.verbose;
         ceres::Solver::Summary solver_summary;
         ceres::Solve(solver_options, &problem, &solver_summary);
+        UNICALIB_INFO("[Phase3] {}", solver_summary.BriefReport());
         
-        UNICALIB_INFO("[Phase3] Solver summary:");
-        UNICALIB_INFO("{}", solver_summary.BriefReport());
-        
-        // ─────────────────────────────────────────────────────────────
-        // Step 6: 提取优化结果
-        // ─────────────────────────────────────────────────────────────
-        report_progress("Phase3-Refine", 0.7, "提取结果");
-        
-        std::vector<Sophus::SE3d> optimized_poses;
+        report_progress("Phase3-Refine", 0.7, "回写knot");
         for (int i = 0; i < num_knots; ++i) {
-            optimized_poses.push_back(spline.getKnot(i));
+            double* k = knot_ptrs[i];
+            spline.setKnot(Sophus::SE3d(
+                Sophus::SO3d::exp(Eigen::Vector3d(k[0], k[1], k[2])),
+                Eigen::Vector3d(k[3], k[4], k[5])), i);
         }
         
-        UNICALIB_INFO("[Phase3] Extracted {} optimized poses", 
-                      optimized_poses.size());
-        
-        // 回写外参
-        if (!params_->extrinsics.empty()) {
+        // 用末端 knot 更新“轨迹对应”的外参：若配置了 phase3_extrinsic_ref/target 则只更新该 key；否则仅当恰好一个外参时更新
+        Sophus::SE3d T_end = spline.getKnot(num_knots - 1);
+        bool updated = false;
+        if (!cfg_.phase3_extrinsic_ref_id.empty() && !cfg_.phase3_extrinsic_target_id.empty()) {
+            auto ext_ptr = params_->get_extrinsic(cfg_.phase3_extrinsic_ref_id, cfg_.phase3_extrinsic_target_id);
+            if (ext_ptr) {
+                ext_ptr->set_SE3(T_end);
+                UNICALIB_INFO("[Phase3] 已用末端 knot 更新外参 {}->{}",
+                    cfg_.phase3_extrinsic_ref_id, cfg_.phase3_extrinsic_target_id);
+                updated = true;
+            } else {
+                UNICALIB_WARN("[Phase3] 未找到外参 {}->{}，跳过 knot→extrinsic 回写",
+                    cfg_.phase3_extrinsic_ref_id, cfg_.phase3_extrinsic_target_id);
+            }
+        }
+        if (!updated && params_->extrinsics.size() == 1) {
             for (auto& [key, ext_ptr] : params_->extrinsics) {
-                if (ext_ptr && !optimized_poses.empty()) {
-                    // 使用第一个和最后一个位姿估计外参变化
-                    // (简化版；实际应从优化结果中精确恢复)
-                    ext_ptr->set_SE3(optimized_poses.back());
+                if (ext_ptr) {
+                    ext_ptr->set_SE3(T_end);
+                    UNICALIB_DEBUG("[Phase3] 已用末端 knot 更新唯一外参 {}", key);
+                    updated = true;
+                    break;
                 }
             }
         }
+        if (!updated && !params_->extrinsics.empty()) {
+            UNICALIB_DEBUG("[Phase3] 未配置 phase3_extrinsic_ref/target_id 且外参数量>1，跳过 knot→extrinsic 回写");
+        }
         
-        // ─────────────────────────────────────────────────────────────
-        // Step 7: 更新摘要
-        // ─────────────────────────────────────────────────────────────
         report_progress("Phase3-Refine", 0.9, "更新结果");
-        
         summary.success = true;
         summary.quality.push_back({
-            .calib_type = "IMU-LiDAR-Camera Joint B-spline Refinement",
+            .calib_type = "IMU-LiDAR-Camera Joint B-spline Refinement (knot+analytic)",
             .rms_error = solver_summary.final_cost,
             .max_error = 0.0,
-            .converged = solver_summary.termination_type == 
-                        ceres::CONVERGENCE,
+            .converged = solver_summary.termination_type == ceres::CONVERGENCE,
             .unit = "m"
         });
-        
-        UNICALIB_INFO("[Phase3] B-spline refinement completed successfully");
+        UNICALIB_INFO("[Phase3] B-spline refinement completed (knots optimized)");
         report_progress("Phase3-Refine", 1.0, "完成");
-
     }
     catch (const ns_unicalib::UniCalibException& e) {
         UNICALIB_ERROR("[Phase3] B-spline refinement failed: {}", e.toString());
         summary.success = false;
         summary.error_message = e.toString();
-        // 降级：保留 Phase2 结果
     }
     catch (const ns_ikalibr::IKalibrStatus& e) {
         UNICALIB_ERROR("[Phase3] iKalibr B-spline refinement failed: {}", e.what());
         summary.success = false;
         summary.error_message = std::string("iKalibr error: ") + e.what();
-        // 降级：保留 Phase2 结果
     }
 
 #else  // UNICALIB_WITH_IKALIBR

@@ -223,10 +223,9 @@ Status JointCalibSolver::calibrate(const CalibDataBundle& data,
         UNICALIB_ERROR("标定错误 [{}]: {}", e.codeValue(), e.what());
         health.heartbeat("joint_calib_solver", HealthStatus::CRITICAL, e.what());
         
-        // 尝试降级策略
-        UNICALIB_WARN("尝试降级策略...");
-        // TODO: 实现降级逻辑
-        
+        // 降级：保留当前 params_（可能含 Phase2 粗外参），调用方可通过 summary.params 或 get_params() 获取
+        summary.params = params_;
+        UNICALIB_WARN("标定异常，返回已得到的参数（若有 Phase2 粗外参可继续使用）");
         return Status::Error(e.code(), e.what());
         
     } catch (const NumericalException& e) {

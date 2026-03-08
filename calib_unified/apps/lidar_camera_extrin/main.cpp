@@ -18,6 +18,7 @@
  *   2) 扁平键: config 中 lidar_data_dir / camera_images_dir (可为相对上述基准路径)
  */
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include "unicalib/common/sensor_types.h"
 #include "unicalib/pipeline/calib_pipeline.h"
 #include "unicalib/pipeline/ai_coarse_calib.h"
@@ -144,12 +145,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    UNICALIB_MAIN_TRY_BEGIN
+
     // ─────────────────────────────────────────────────────────────────
-    // 初始化日志
+    // 初始化日志（写入 logs 目录，文件名带时间戳）
     // ─────────────────────────────────────────────────────────────────
-    fs::create_directories(output_dir + "/logs");
+    std::string logs_dir = resolve_logs_dir(output_dir);
+    std::string log_file = logs_dir + "/lidar_camera_" + log_timestamp_filename() + ".log";
     Logger::init("LiDAR-Camera",
-                 output_dir + "/logs/lidar_camera_calib.log",
+                 log_file,
                  log_level == "debug"   ? spdlog::level::debug   :
                  log_level == "trace"   ? spdlog::level::trace   :
                  log_level == "warn"    ? spdlog::level::warn    :
@@ -351,7 +355,9 @@ int main(int argc, char** argv) {
                     pipe_cfg.camera_id = s.sensor_id;
                 }
             }
-        } catch (const std::exception&) { /* 忽略，沿用命令行或 ros2 段 */ }
+        } catch (const std::exception& e) {
+            UNICALIB_DEBUG("从系统配置读取 ROS2 话题失败，沿用命令行或 ros2 段: {}", e.what());
+        }
     }
     
     // 设置数据源配置
@@ -504,5 +510,5 @@ int main(int argc, char** argv) {
     UNICALIB_INFO("LiDAR-Camera 标定流程完成");
     UNICALIB_INFO("结果目录: {}", output_dir);
     UNICALIB_INFO("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    return 0;
+    UNICALIB_MAIN_TRY_END(0)
 }

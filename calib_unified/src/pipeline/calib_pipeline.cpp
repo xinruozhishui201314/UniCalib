@@ -8,6 +8,9 @@
  */
 
 #include "unicalib/pipeline/calib_pipeline.h"
+#include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
+#include "unicalib/common/accuracy_logger.h"
 #include "unicalib/extrinsic/lidar_camera_calib.h"
 #include "unicalib/io/yaml_io.h"
 #include "unicalib/io/ros2_data_source.h"
@@ -142,9 +145,9 @@ CalibPipeline::CalibPipeline(const PipelineConfig& cfg)
 
 std::string CalibPipeline::make_stage_log_path(CalibStage stage,
                                                 CalibTaskType task) const {
-    return cfg_.output_dir + "/logs/" +
-           std::string(stage_name(stage)) + "_" + task_str(task) + "_" +
-           now_str() + ".log";
+    std::string logs_dir = resolve_logs_dir(cfg_.output_dir);
+    return logs_dir + "/" + std::string(stage_name(stage)) + "_" +
+           task_str(task) + "_" + now_str() + ".log";
 }
 
 void CalibPipeline::setup_stage_logger(const std::string& log_path) {
@@ -152,7 +155,8 @@ void CalibPipeline::setup_stage_logger(const std::string& log_path) {
         auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
             log_path, true);
         file_sink->set_level(spdlog::level::trace);
-        file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+        // 与统一日志一致：每条记录带完整日期时间
+        file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] %v");
 
         auto console_sink =
             std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
@@ -258,7 +262,35 @@ PipelineReport CalibPipeline::run() {
             setup_stage_logger(log_path);
             log_stage_begin(CalibStage::COARSE_AI, task,
                             "AI模型提供初始估计值");
-            auto r = run_coarse_stage(task);
+            StageResult r;
+            try {
+                r = run_coarse_stage(task);
+            } catch (const UniCalibException& e) {
+                r = StageResult{};
+                r.stage = CalibStage::COARSE_AI;
+                r.task = task;
+                r.success = false;
+                r.message = std::string("[") + errorCodeName(e.code()) + "] " + e.message() +
+                            " (at " + e.file() + ":" + std::to_string(e.line()) + ")";
+                r.elapsed_ms = 0;
+                UNICALIB_ERROR("[Pipeline] 粗标定阶段异常: {}", r.message);
+            } catch (const std::exception& e) {
+                r = StageResult{};
+                r.stage = CalibStage::COARSE_AI;
+                r.task = task;
+                r.success = false;
+                r.message = std::string("std::exception: ") + e.what();
+                r.elapsed_ms = 0;
+                UNICALIB_ERROR("[Pipeline] 粗标定阶段异常: {}", r.message);
+            } catch (...) {
+                r = StageResult{};
+                r.stage = CalibStage::COARSE_AI;
+                r.task = task;
+                r.success = false;
+                r.message = "未知异常 (非 std::exception)";
+                r.elapsed_ms = 0;
+                UNICALIB_ERROR("[Pipeline] 粗标定阶段未知异常");
+            }
             r.log_file = log_path;
             log_stage_end(r);
             report_.stage_results.push_back(r);
@@ -270,7 +302,35 @@ PipelineReport CalibPipeline::run() {
             setup_stage_logger(log_path);
             log_stage_begin(CalibStage::FINE_AUTO, task,
                             cfg_.prefer_targetfree ? "无目标优化" : "目标辅助优化");
-            auto r = run_fine_stage(task);
+            StageResult r;
+            try {
+                r = run_fine_stage(task);
+            } catch (const UniCalibException& e) {
+                r = StageResult{};
+                r.stage = CalibStage::FINE_AUTO;
+                r.task = task;
+                r.success = false;
+                r.message = std::string("[") + errorCodeName(e.code()) + "] " + e.message() +
+                            " (at " + e.file() + ":" + std::to_string(e.line()) + ")";
+                r.elapsed_ms = 0;
+                UNICALIB_ERROR("[Pipeline] 精标定阶段异常: {}", r.message);
+            } catch (const std::exception& e) {
+                r = StageResult{};
+                r.stage = CalibStage::FINE_AUTO;
+                r.task = task;
+                r.success = false;
+                r.message = std::string("std::exception: ") + e.what();
+                r.elapsed_ms = 0;
+                UNICALIB_ERROR("[Pipeline] 精标定阶段异常: {}", r.message);
+            } catch (...) {
+                r = StageResult{};
+                r.stage = CalibStage::FINE_AUTO;
+                r.task = task;
+                r.success = false;
+                r.message = "未知异常 (非 std::exception)";
+                r.elapsed_ms = 0;
+                UNICALIB_ERROR("[Pipeline] 精标定阶段未知异常");
+            }
             r.log_file = log_path;
             log_stage_end(r);
             report_.stage_results.push_back(r);
@@ -283,7 +343,34 @@ PipelineReport CalibPipeline::run() {
                               r.residual_rms);
                 log_stage_begin(CalibStage::MANUAL_REFINE, task,
                                 "手动校准: 6-DOF 交互式调整");
-                auto rm = run_manual_stage(task);
+                StageResult rm;
+                try {
+                    rm = run_manual_stage(task);
+                } catch (const UniCalibException& e) {
+                    rm = StageResult{};
+                    rm.stage = CalibStage::MANUAL_REFINE;
+                    rm.task = task;
+                    rm.success = false;
+                    rm.message = std::string("[") + errorCodeName(e.code()) + "] " + e.message();
+                    rm.elapsed_ms = 0;
+                    UNICALIB_ERROR("[Pipeline] 手动校准阶段异常: {}", rm.message);
+                } catch (const std::exception& e) {
+                    rm = StageResult{};
+                    rm.stage = CalibStage::MANUAL_REFINE;
+                    rm.task = task;
+                    rm.success = false;
+                    rm.message = std::string("std::exception: ") + e.what();
+                    rm.elapsed_ms = 0;
+                    UNICALIB_ERROR("[Pipeline] 手动校准阶段异常: {}", rm.message);
+                } catch (...) {
+                    rm = StageResult{};
+                    rm.stage = CalibStage::MANUAL_REFINE;
+                    rm.task = task;
+                    rm.success = false;
+                    rm.message = "未知异常";
+                    rm.elapsed_ms = 0;
+                    UNICALIB_ERROR("[Pipeline] 手动校准阶段未知异常");
+                }
                 rm.log_file = log_path_m;
                 log_stage_end(rm);
                 report_.stage_results.push_back(rm);
@@ -298,6 +385,26 @@ PipelineReport CalibPipeline::run() {
     std::string report_path = cfg_.output_dir + "/pipeline_report_" +
                                report_.pipeline_id.substr(9) + ".yaml";
     report_.save_report(report_path);
+
+    // 将各阶段精度追加到对应 CSV，便于绘制曲线
+    static const auto task_to_accuracy = [](CalibTaskType t) -> std::optional<CalibAccuracyTask> {
+        switch (t) {
+            case CalibTaskType::CAM_INTRINSIC:     return CalibAccuracyTask::CAM_INTRINSIC;
+            case CalibTaskType::IMU_INTRINSIC:     return CalibAccuracyTask::IMU_INTRINSIC;
+            case CalibTaskType::LIDAR_CAM_EXTRIN:  return CalibAccuracyTask::LIDAR_CAM_EXTRIN;
+            case CalibTaskType::CAM_CAM_EXTRIN:    return CalibAccuracyTask::CAM_CAM_EXTRIN;
+            case CalibTaskType::IMU_LIDAR_EXTRIN:   return CalibAccuracyTask::IMU_LIDAR_EXTRIN;
+            default: return std::nullopt;
+        }
+    };
+    for (const auto& r : report_.stage_results) {
+        if (r.stage != CalibStage::FINE_AUTO && r.stage != CalibStage::MANUAL_REFINE)
+            continue;
+        auto at = task_to_accuracy(r.task);
+        if (!at.has_value()) continue;
+        append_stage_result_accuracy(cfg_.output_dir, *at,
+            r.success, r.residual_rms, r.elapsed_ms, r.message);
+    }
 
     return report_;
 }
@@ -495,8 +602,7 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
 
     if (data_source_type == DataSourceType::FILES) {
         // 从文件加载数据
-        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 从文件加载点云...");
-        
+        UNICALIB_LOG_STEP("Fine-Auto/LiDAR-Cam", "步骤: 开始从文件加载点云");
         std::vector<fs::path> pcd_files;
         for (const auto& entry : fs::directory_iterator(cfg_.lidar_data_dir)) {
             if (entry.path().extension() == ".pcd" || entry.path().extension() == ".PCD") {
@@ -533,8 +639,8 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
             }
         }
 
-        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 加载 {} 帧点云 (共 {} 文件)",
-                      lidar_scans.size(), pcd_files.size());
+        UNICALIB_LOG_STEP("Fine-Auto/LiDAR-Cam", "步骤: 点云加载完成 — {} 帧 (共 {} 文件)",
+                          lidar_scans.size(), pcd_files.size());
 
         if (lidar_scans.empty()) {
             r.success = false;
@@ -545,7 +651,7 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
         }
 
         // 从文件加载相机图像
-        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 从文件加载图像...");
+        UNICALIB_LOG_STEP("Fine-Auto/LiDAR-Cam", "步骤: 开始从文件加载图像");
     std::vector<std::pair<double, cv::Mat>> camera_frames;
 
     std::vector<fs::path> img_files;
@@ -582,8 +688,8 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
             }
         }
 
-        UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 加载 {} 帧图像 (共 {} 文件)",
-                      camera_frames.size(), img_files.size());
+        UNICALIB_LOG_STEP("Fine-Auto/LiDAR-Cam", "步骤: 图像加载完成 — {} 帧 (共 {} 文件)",
+                          camera_frames.size(), img_files.size());
 
         if (camera_frames.empty()) {
             r.success = false;
@@ -665,6 +771,7 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
     }
 
     // ─── 4. 加载/默认相机内参 ─────────────────────────────────────────────
+    UNICALIB_LOG_STEP("Fine-Auto/LiDAR-Cam", "步骤: 加载相机内参");
     CameraIntrinsics cam_intrin;
     if (!cfg_.camera_intrinsic_file.empty() && fs::exists(cfg_.camera_intrinsic_file)) {
         UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 加载内参: {}", cfg_.camera_intrinsic_file);
@@ -694,6 +801,8 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
     }
 
     // ─── 5. 调用 LiDARCameraCalibrator ─────────────────────────────────────
+    UNICALIB_LOG_STEP("Fine-Auto/LiDAR-Cam", "步骤: 开始 LiDAR-Camera 标定 (方法: {})",
+                      cfg_.prefer_targetfree ? "边缘对齐" : "棋盘格目标");
     LiDARCameraCalibrator::Config calib_cfg;
 
     // 方法选择
@@ -728,6 +837,8 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
     });
 
     // 执行两阶段标定
+    UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 执行标定: 点云 {} 帧, 图像 {} 帧",
+                  lidar_scans.size(), camera_frames.size());
     Sophus::SE3d init_guess = Sophus::SE3d();  // identity 作为初值
     auto result = calibrator.calibrate_two_stage(
         lidar_scans, camera_frames, cam_intrin,
@@ -738,6 +849,7 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
     // ─── 6. 结果处理 ──────────────────────────────────────────────────────
     auto t_end = std::chrono::high_resolution_clock::now();
     r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    UNICALIB_LOG_STEP("Fine-Auto/LiDAR-Cam", "步骤: 标定计算完成 — 耗时 {:.1f} ms", r.elapsed_ms);
 
     if (result.best() != nullptr) {
         r.success = true;

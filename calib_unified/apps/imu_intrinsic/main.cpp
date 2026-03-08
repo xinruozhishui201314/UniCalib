@@ -10,13 +10,16 @@
  */
 
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include "unicalib/common/sensor_types.h"
 #include "unicalib/common/calib_param.h"
+#include "unicalib/common/accuracy_logger.h"
 #include "unicalib/intrinsic/imu_intrinsic_calib.h"
 #include "unicalib/viz/report_gen.h"
 #include <yaml-cpp/yaml.h>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -142,25 +145,29 @@ ns_unicalib::IMURawData load_imu_csv(const std::string& csv_path) {
 // 主函数
 // ===================================================================
 int main(int argc, char** argv) {
-    // 初始化日志
-    ns_unicalib::Logger::init("UniCalib-IMU-Intrinsic");
-
     std::cout << R"(
  ╔══════════════════════════════════════════════╗
  ║    UniCalib — IMU 内参标定 (Allan + 六面法)  ║
  ╚══════════════════════════════════════════════╝
 )" << std::endl;
 
+    UNICALIB_MAIN_TRY_BEGIN
+
     // 解析配置
     auto cfg = parse_config(argc, argv);
 
     if (cfg.data_file.empty()) {
+        ns_unicalib::Logger::init("UniCalib-IMU-Intrinsic");
         UNICALIB_ERROR("No data file specified. Use --data_file or --config");
         return 1;
     }
 
-    // 创建输出目录
+    // 创建输出目录，运行日志写入 output_dir/logs
     fs::create_directories(cfg.output_dir);
+    std::string logs_dir = ns_unicalib::resolve_logs_dir(cfg.output_dir);
+    std::string log_file = logs_dir + "/imu_intrinsic_" + ns_unicalib::log_timestamp_filename() + ".log";
+    ns_unicalib::Logger::init("UniCalib-IMU-Intrinsic", log_file, spdlog::level::info);
+    UNICALIB_INFO("日志文件: {}", log_file);
 
     // 加载 IMU 数据
     UNICALIB_INFO("Loading IMU data from: {}", cfg.data_file);
@@ -222,9 +229,28 @@ int main(int argc, char** argv) {
     std::string yaml_path = cfg.output_dir + "/imu_intrinsic_" + cfg.sensor_id + ".yaml";
     {
         std::ofstream yaml_out(yaml_path);
-        yaml_out << result_node;
-        UNICALIB_INFO("Results saved to: {}", yaml_path);
+        if (!yaml_out.is_open()) {
+            UNICALIB_ERROR("无法写入结果文件: {}", yaml_path);
+        } else {
+            yaml_out << result_node;
+            UNICALIB_INFO("Results saved to: {}", yaml_path);
+        }
     }
+
+    // 精度记录到 CSV（IMU 无单一 residual_rms，记录噪声与零偏不稳）
+    double elapsed_ms = elapsed * 1000.0;
+    std::ostringstream ng, bg, na, ba;
+    ng << std::scientific << intrin.noise_gyro;
+    bg << std::scientific << intrin.bias_instab_gyro;
+    na << std::scientific << intrin.noise_acce;
+    ba << std::scientific << intrin.bias_instab_acce;
+    std::map<std::string, std::string> extra;
+    extra["noise_gyro"] = ng.str();
+    extra["bias_instab_gyro"] = bg.str();
+    extra["noise_accel"] = na.str();
+    extra["bias_instab_accel"] = ba.str();
+    append_calib_accuracy(cfg.output_dir, CalibAccuracyTask::IMU_INTRINSIC,
+        true, 0.0, elapsed_ms, extra);
 
     // 打印终端摘要
     std::cout << "\n";
@@ -244,5 +270,5 @@ int main(int argc, char** argv) {
     std::cout << "└──────────────────────┴─────────────────────────────┘\n";
     std::cout << "\n结果保存至: " << cfg.output_dir << "\n\n";
 
-    return 0;
+    UNICALIB_MAIN_TRY_END(0)
 }

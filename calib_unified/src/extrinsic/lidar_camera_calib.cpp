@@ -8,6 +8,7 @@
 
 #include "unicalib/extrinsic/lidar_camera_calib.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <opencv2/calib3d.hpp>
@@ -103,7 +104,7 @@ bool LiDARCameraCalibrator::detect_board_in_lidar(
         cloud_filtered->push_back(pt);
     }
     
-    UNICALIB_DEBUG("[DetectBoard] 下采样: {} -> {} 点", cloud->size(), cloud_filtered->size());
+    UNICALIB_INFO("[DetectBoard] 步骤1 体素下采样完成: {} -> {} 点", cloud->size(), cloud_filtered->size());
 
     if (cloud_filtered->size() < MIN_POINTS) {
         UNICALIB_WARN("[DetectBoard] 下采样后点数不足");
@@ -179,9 +180,8 @@ bool LiDARCameraCalibrator::detect_board_in_lidar(
               [](const PlaneModel& a, const PlaneModel& b) { return a.score > b.score; });
 
     const auto& best_plane = candidate_planes[0];
-    UNICALIB_DEBUG("[DetectBoard] 找到平面: normal=[{:.3f},{:.3f},{:.3f}] d={:.3f} inliers={}",
-                   best_plane.normal.x(), best_plane.normal.y(), best_plane.normal.z(),
-                   best_plane.d, best_plane.inliers.size());
+    UNICALIB_INFO("[DetectBoard] 步骤2 RANSAC 平面拟合完成: inliers={}",
+                  best_plane.inliers.size());
 
     // =================================================================
     // Step 3: 投影到平面，构建局部2D坐标系
@@ -252,8 +252,8 @@ bool LiDARCameraCalibrator::detect_board_in_lidar(
     // =================================================================
     // Step 5: 生成角点网格 (基于已知棋盘格参数)
     // =================================================================
+    UNICALIB_INFO("[DetectBoard] 步骤5 生成角点网格: {}x{}", cfg_.board_rows, cfg_.board_cols);
     // 假设棋盘格在平面内均匀分布，从边界框生成规则网格
-    
     const int rows = cfg_.board_rows;
     const int cols = cfg_.board_cols;
     const double cell_w = board_width_estimate / (cols - 1);
@@ -408,6 +408,8 @@ std::optional<ExtrinsicSE3> LiDARCameraCalibrator::calibrate_target(
         return std::nullopt;
     }
 
+    UNICALIB_INFO("[LiDAR-Cam/Target] 步骤: 开始帧同步 (LiDAR {} 帧, 图像 {} 帧)",
+                  lidar_scans.size(), camera_frames.size());
     // 同步帧 (时间戳最近匹配)
     std::vector<cv::Point3f> pts3d_all;
     std::vector<cv::Point2f> pts2d_all;
@@ -443,6 +445,8 @@ std::optional<ExtrinsicSE3> LiDARCameraCalibrator::calibrate_target(
         if (!detect_board_in_lidar(*best_scan, lidar_corners)) continue;
         if (lidar_corners.size() != img_corners.size()) continue;
 
+        UNICALIB_DEBUG("[LiDAR-Cam/Target] 步骤: 角点检测 — 图像 {} 点, LiDAR {} 点",
+                       img_corners.size(), lidar_corners.size());
         for (size_t i = 0; i < lidar_corners.size(); ++i) {
             pts3d_all.emplace_back(
                 static_cast<float>(lidar_corners[i].x()),
@@ -464,9 +468,22 @@ std::optional<ExtrinsicSE3> LiDARCameraCalibrator::calibrate_target(
     cv::Mat dist = cv::Mat(cam_intrin.dist_coeffs).reshape(1, 1);
     cv::Mat rvec, tvec;
     cv::Mat inliers;
-    cv::solvePnPRansac(pts3d_all, pts2d_all, K, dist, rvec, tvec,
-                       false, 200, 8.0f, 0.99, inliers, cv::SOLVEPNP_ITERATIVE);
-    cv::solvePnPRefineLM(pts3d_all, pts2d_all, K, dist, rvec, tvec);
+    UNICALIB_INFO("[LiDAR-Cam/Target] 步骤: PnP 求解外参 (3D-2D 对应 {} 对)", pts3d_all.size());
+    try {
+        cv::solvePnPRansac(pts3d_all, pts2d_all, K, dist, rvec, tvec,
+                           false, 200, 8.0f, 0.99, inliers, cv::SOLVEPNP_ITERATIVE);
+        if (inliers.rows < 6) {
+            UNICALIB_WARN("[LiDAR-Cam/Target] PnP RANSAC 内点不足: {} (需≥6)", inliers.rows);
+            return std::nullopt;
+        }
+        cv::solvePnPRefineLM(pts3d_all, pts2d_all, K, dist, rvec, tvec);
+    } catch (const cv::Exception& e) {
+        UNICALIB_ERROR("[LiDAR-Cam/Target] OpenCV PnP 异常: {}", e.what());
+        return std::nullopt;
+    } catch (const std::exception& e) {
+        UNICALIB_ERROR("[LiDAR-Cam/Target] PnP 求解异常: {}", e.what());
+        return std::nullopt;
+    }
 
     std::vector<cv::Point2f> proj;
     cv::projectPoints(pts3d_all, rvec, tvec, K, dist, proj);
@@ -481,12 +498,13 @@ std::optional<ExtrinsicSE3> LiDARCameraCalibrator::calibrate_target(
 
     Eigen::Vector3d rv(rvec.at<double>(0), rvec.at<double>(1), rvec.at<double>(2));
     Eigen::Vector3d tv(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
-    Eigen::AngleAxisd aa(rv.norm(), rv.normalized());
+    Sophus::SO3d R_cam_lidar =
+        (rv.norm() < 1e-10) ? Sophus::SO3d() : Sophus::SO3d(Eigen::AngleAxisd(rv.norm(), rv.normalized()));
 
     ExtrinsicSE3 result;
     result.ref_sensor_id    = lidar_id;
     result.target_sensor_id = cam_id;
-    result.SO3_TargetInRef  = Sophus::SO3d(aa.toRotationMatrix());
+    result.SO3_TargetInRef  = R_cam_lidar;
     result.POS_TargetInRef  = tv;
     result.residual_rms     = rms;
     result.is_converged     = (rms < cfg_.max_reproj_error_px);

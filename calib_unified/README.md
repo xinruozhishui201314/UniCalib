@@ -160,6 +160,40 @@ make -j$(nproc)
 - `allan_gyro.png` — Allan 偏差图
 - `report.html` — 交互式 HTML 标定报告
 
+## 编译与运行日志（统一落盘）
+
+所有编译与运行产生的日志均写入目录，便于排查与审计：
+
+| 类型 | 目录 | 说明 |
+|------|------|------|
+| **编译日志** | `<项目根>/logs/` | `build.sh` 将 cmake 构建输出写入 `logs/build_YYYYMMDD_HHMMSS.log`；可通过环境变量 `REPO_LOGS_DIR` 覆盖目录 |
+| **运行日志** | `<output_dir>/logs/` | 各标定 app 将 spdlog 输出写入 `output_dir/logs/<app>_YYYYMMDD_HHMMSS.log`（如 `camera_intrinsic_*.log`）；可通过环境变量 `UNICALIB_LOGS_DIR` 覆盖目录 |
+| **流水线阶段日志** | `output_dir/logs/` | `CalibPipeline` 每个阶段单独写 `Fine-Auto_<task>_*.log` 等 |
+
+使用 Makefile 时：`LOGS_DIR` 默认 `$(WORKSPACE_DIR)/logs`，编译日志为 `$(LOGS_DIR)/build_*.log`，容器内运行时可设置 `UNICALIB_LOGS_DIR` 将运行日志写到指定目录。
+
+## 标定精度记录与曲线
+
+每次标定运行会将**精度指标追加到 CSV**，便于对比多次运行与绘制趋势图：
+
+| 文件 | 内容 |
+|------|------|
+| `calib_accuracy_cam_intrinsic.csv` | 相机内参：timestamp, success, residual_rms, elapsed_ms, num_images |
+| `calib_accuracy_imu_intrinsic.csv` | IMU 内参：噪声/零偏不稳 (noise_gyro, bias_instab_gyro, noise_accel, bias_instab_accel) |
+| `calib_accuracy_lidar_cam_extrin.csv` | LiDAR-相机外参：residual_rms (px), elapsed_ms, message |
+| `calib_accuracy_cam_cam_extrin.csv` | 相机-相机外参：residual_rms, elapsed_ms, message |
+| `calib_accuracy_imu_lidar_extrin.csv` | IMU-LiDAR 外参：residual_rms, elapsed_ms, message |
+
+**绘制曲线图**（需 `pip install pandas matplotlib`）：
+
+```bash
+cd calib_unified/scripts
+python3 plot_calib_accuracy.py --dir ../calib_output --out ../calib_output/calib_accuracy_plots.png
+# 弹窗查看: python3 plot_calib_accuracy.py --dir ../calib_output --show
+```
+
+脚本会生成 2×3 子图，每种标定一张，横轴为运行次数、纵轴为 residual_rms 或 IMU 噪声/零偏指标。
+
 ## tiny-viewer 移除方案
 
 原始 iKalibr 依赖 `tiny-viewer` 进行 3D 可视化。本项目通过以下方式彻底移除:
@@ -216,12 +250,12 @@ graph TD
 
 | 项目 | 状态 | 说明 |
 |---|---|---|
-| iKalibr B样条联合精化 | ✅ 框架实现 | phase3_joint_refine 已包含完整集成代码；数据转换层与结果回写已实现骨架 |
+| iKalibr B样条联合精化 | ✅ 已实现 | phase3_joint_refine：knot 参数化 + basalt pose(t,&J) 解析雅可比，轨迹拟合残差加入 Ceres |
 | LiDAR 棋盘格检测 | ✅ 已实现 | 体素下采样 → RANSAC 平面拟合 → 生成网格角点 |
 | AI 模块安全加固 | ✅ 已实现 | exec_cmd_safe 使用 fork+execvp，无 shell 注入风险 |
 | IMU bias 校正 | ✅ 已实现 | integrate_imu_rotation 支持可选的 bias_gyro 扣除 |
-| 时间偏移精确估计 | ⚠️ 初步 | B样条精化中提供精确估计（iKalibr 提供） |
-| Camera-Camera BA | ⚠️ 框架 | 完整多视图 BA 待集成 |
+| 时间偏移精确估计 | ✅ 已实现 | IMU-LiDAR B样条精化使用 basalt d_pose_d_t + 解析雅可比（SplineExtrinsicAnalyticCost） |
+| Camera-Camera BA | ✅ 已实现 | 完整多视图 BA：calibrate_bundle_adjustment_full_multiview，可配置 use_full_multiview_ba / ba_min_tracks_multiview |
 | ROS bag 读取 | 可选 | 通过 --ros2 编译选项启用 |
 
 ## Phase 3: B 样条联合精化实现说明
@@ -257,14 +291,16 @@ CalibDataBundle (Phase2 粗外参)
 - 作用: 将 UniCalib 帧类型转为 iKalibr 帧类型（兼容 ns_ctraj::Frame）
 
 #### 2. 求解器集成（phase3_joint_refine）
-- 位置: `src/solver/joint_calib_solver.cpp` 行 434-580
-- 步骤:
-  1. 创建 ns_ikalibr::CalibDataManager（数据管理）
-  2. 创建 ns_ikalibr::CalibParamManager（参数管理，初值为 Phase2 粗外参）
-  3. 创建 ns_ikalibr::CalibSolver（求解器）
-  4. 调用 solver->Process()（核心优化）
-  5. 通过 iKalibrResultWriter 回写外参/内参/时间偏移
-- 异常处理: 捕获 ns_ikalibr::IKalibrStatus 与标准异常
+- 位置: `src/solver/joint_calib_solver.cpp`（Phase3 段）
+- 步骤（basalt-headers 路径，UNICALIB_WITH_IKALIBR=ON 时）:
+  1. 从 LiDAR 轨迹收集 (t, T_w_lidar)，构造 basalt::Se3Spline<5>
+  2. 将 knot 存为 6 维/个（angle_axis+trans），加入 Ceres 为 parameter blocks
+  3. 为每条轨迹点添加 SplineTrajectoryCost：残差 = log(spline.pose(t)^{-1} * T_meas)，雅可比由 spline.pose(t,&J) 解析
+  4. Ceres 求解后回写 knot 到样条，并**按配置更新外参**：
+     - 若 `phase3_extrinsic_ref_id` 与 `phase3_extrinsic_target_id` 均非空，则只更新该 key 的外参；
+     - 否则若当前仅 1 个外参则更新该唯一外参；多外参且未配置上述两项时不写回（避免误覆盖）
+  5. **Ceres 版本**：Phase3 使用 `AddResidualBlock(..., std::vector<double*>)`，需 Ceres 2.x；若使用 1.x 需改为逐指针传入
+- 异常处理: 捕获 UniCalibException 与 IKalibrStatus，失败时保留 Phase2 结果
 
 #### 3. 结果回写（iKalibrResultWriter）
 - 位置: `include/unicalib/solver/joint_calib_solver.h` 行 177-193
@@ -289,6 +325,9 @@ option(UNICALIB_WITH_IKALIBR "Build iKalibr B-spline engine" ON)
 1. **数据加载**: 当前为演示骨架，实际生产需完成 CalibDataBundle → iKalibr 帧格式转换
 2. **参数回写**: iKalibrResultWriter 中的 write_* 方法待实现具体 API 调用（需参考 iKalibr 版本）
 3. **ROS bag 支持**: 若 UNICALIB_WITH_ROS2=ON，可通过临时 bag 文件完成数据加载
+4. **Phase3 多外参**: 多外参场景下请设置 `phase3_extrinsic_ref_id` / `phase3_extrinsic_target_id` 指定轨迹对应的外参，否则不会写回
+5. **IMU-LiDAR 手动验证**: `calibrate_manual_verify` 当前为最小实现（返回初值并打日志），完整可视化/增量调整 TODO
+6. **LiDAR-Camera**: 棋盘格法依赖 `detect_board_in_lidar` 完整实现；运动法当前仅返回 IMU-LiDAR 外参作为初值占位
 
 ### 验证与测试
 

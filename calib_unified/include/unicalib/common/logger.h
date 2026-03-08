@@ -26,12 +26,44 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <cstdlib>
 
 #include "error_code.h"
 
 namespace ns_unicalib {
 
 namespace fs = std::filesystem;
+
+// ===================================================================
+// 日志目录与时间戳工具（编译/运行日志统一写入 logs/ 并带时间）
+// ===================================================================
+// 环境变量 UNICALIB_LOGS_DIR: 若设置则运行日志写入该目录（如项目根下 logs/）
+// 否则使用 output_dir + "/logs"
+inline std::string resolve_logs_dir(const std::string& output_dir) {
+    const char* env = std::getenv("UNICALIB_LOGS_DIR");
+    std::string dir = env ? std::string(env) : (output_dir + "/logs");
+    fs::create_directories(dir);
+    return dir;
+}
+
+// 用于日志文件名的时间戳，格式 YYYYMMDD_HHMMSS
+inline std::string log_timestamp_filename() {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf{};
+#ifdef _WIN32
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm_buf, "%Y%m%d_%H%M%S");
+    return oss.str();
+}
 
 // ===================================================================
 // LoggerConfig — 日志配置

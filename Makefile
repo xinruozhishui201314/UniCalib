@@ -10,6 +10,10 @@ COMPOSE_FILE  := docker/docker-compose.yaml
 # 数据/结果目录（可通过环境变量覆盖）
 CALIB_DATA_DIR    ?= /tmp/calib_data
 CALIB_RESULTS_DIR ?= /tmp/calib_results
+# 编译/运行日志统一写入 logs/ 并带时间戳
+LOGS_DIR          ?= $(WORKSPACE_DIR)/logs
+BUILD_LOG_TS      := $(shell date +%Y%m%d_%H%M%S)
+BUILD_LOG_FILE    ?= $(LOGS_DIR)/build_$(BUILD_LOG_TS).log
 
 .PHONY: help build build-cpp run run-intrinsic run-fine run-python run-python-intrinsic run-python-fine shell test lint check-data visualize clean
 
@@ -36,6 +40,7 @@ help:
 	@echo "环境变量:"
 	@echo "  CALIB_DATA_DIR    数据目录 (默认: /tmp/calib_data)"
 	@echo "  CALIB_RESULTS_DIR 结果目录 (默认: /tmp/calib_results)"
+	@echo "  LOGS_DIR          编译/运行日志目录 (默认: \$(WORKSPACE_DIR)/logs)"
 	@echo ""
 
 ## -------------------------------------------------------------------------
@@ -44,15 +49,17 @@ help:
 
 build:
 	@echo ">>> 构建 Docker 镜像: $(DOCKER_IMAGE)"
-	cd docker && docker build -t $(DOCKER_IMAGE) . 2>&1 | tee docker/build.log
-	@echo ">>> 构建完成"
+	@mkdir -p $(LOGS_DIR)
+	cd docker && docker build -t $(DOCKER_IMAGE) . 2>&1 | tee docker/build.log | tee $(LOGS_DIR)/docker_build_$(BUILD_LOG_TS).log
+	@echo ">>> 构建完成 | 日志: $(LOGS_DIR)/docker_build_$(BUILD_LOG_TS).log"
 
 build-cpp:
 	@echo ">>> 在容器内构建 C++ 主框架 (unicalib_C_plus_plus)"
+	@mkdir -p $(LOGS_DIR)
 	CALIB_DATA_DIR=$(CALIB_DATA_DIR) CALIB_RESULTS_DIR=$(CALIB_RESULTS_DIR) \
 	docker-compose -f $(COMPOSE_FILE) run --rm unicalib \
-		bash -c "cd /root/calib_ws/unicalib_C_plus_plus && mkdir -p build && cd build && cmake .. && make -j\$$(nproc)"
-	@echo ">>> C++ 构建完成"
+		bash -c "cd /root/calib_ws/unicalib_C_plus_plus && mkdir -p build && cd build && cmake .. && make -j\$$(nproc)" 2>&1 | tee $(BUILD_LOG_FILE)
+	@echo ">>> C++ 构建完成 | 日志: $(BUILD_LOG_FILE)"
 
 shell:
 	@echo ">>> 进入容器 Shell"
@@ -66,9 +73,11 @@ shell:
 
 run:
 	@echo ">>> 运行完整标定流水线（C++ 主框架）"
-	mkdir -p $(CALIB_RESULTS_DIR)
+	@mkdir -p $(CALIB_RESULTS_DIR) $(LOGS_DIR)
 	CALIB_DATA_DIR=$(CALIB_DATA_DIR) \
 	CALIB_RESULTS_DIR=$(CALIB_RESULTS_DIR) \
+	CALIB_LOGS_DIR=$(LOGS_DIR) \
+	UNICALIB_LOGS_DIR=/root/calib_ws/logs \
 	docker-compose -f $(COMPOSE_FILE) run --rm unicalib /opt/scripts/run_calib_cpp.sh
 
 run-intrinsic:

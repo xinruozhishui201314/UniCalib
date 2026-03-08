@@ -11,6 +11,8 @@
  */
 
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
+#include "unicalib/common/accuracy_logger.h"
 #include "unicalib/intrinsic/camera_calib.h"
 #include <yaml-cpp/yaml.h>
 #include <opencv2/highgui.hpp>
@@ -21,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 namespace fs = std::filesystem;
 using namespace ns_unicalib;
@@ -47,15 +50,15 @@ std::vector<std::string> collect_images(const std::string& dir) {
 // 主函数
 // ===================================================================
 int main(int argc, char** argv) {
-    ns_unicalib::Logger::init("UniCalib-Camera-Intrinsic");
-
     std::cout << R"(
  ╔══════════════════════════════════════════════╗
  ║    UniCalib — 相机内参标定 (针孔 + 鱼眼)    ║
  ╚══════════════════════════════════════════════╝
 )" << std::endl;
 
-    // --- 参数解析 ---
+    UNICALIB_MAIN_TRY_BEGIN
+
+    // --- 参数解析（先解析 output_dir 以便日志落盘）---
     std::string images_dir;
     std::string model_str = "pinhole";
     std::string output_dir = "./calib_output/camera_intrinsic";
@@ -148,9 +151,17 @@ int main(int argc, char** argv) {
     }
 
     if (images_dir.empty()) {
+        ns_unicalib::Logger::init("UniCalib-Camera-Intrinsic");
         UNICALIB_ERROR("No images directory specified. Use --images_dir or --config");
         return 1;
     }
+
+    // 运行日志写入 output_dir/logs，便于追溯
+    fs::create_directories(output_dir);
+    std::string logs_dir = ns_unicalib::resolve_logs_dir(output_dir);
+    std::string log_file = logs_dir + "/camera_intrinsic_" + ns_unicalib::log_timestamp_filename() + ".log";
+    ns_unicalib::Logger::init("UniCalib-Camera-Intrinsic", log_file, spdlog::level::info);
+    UNICALIB_INFO("日志文件: {}", log_file);
 
     // 设置模型
     if (model_str == "fisheye") {
@@ -171,6 +182,7 @@ int main(int argc, char** argv) {
     }
 
     // 标定
+    auto t_calib_start = std::chrono::high_resolution_clock::now();
     CameraIntrinsicCalibrator calibrator(cfg);
     calibrator.set_progress_callback([](int cur, int total) {
         if (cur % 10 == 0 || cur == total - 1) {
@@ -180,8 +192,12 @@ int main(int argc, char** argv) {
 
     auto result = calibrator.calibrate(image_paths);
     std::cout << std::endl;
+    auto t_calib_end = std::chrono::high_resolution_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_calib_end - t_calib_start).count();
 
     if (!result.has_value()) {
+        append_calib_accuracy(output_dir, CalibAccuracyTask::CAM_INTRINSIC,
+            false, -1.0, elapsed_ms, {});
         UNICALIB_ERROR("Camera intrinsic calibration FAILED");
         return 1;
     }
@@ -205,9 +221,19 @@ int main(int argc, char** argv) {
     std::string yaml_path = output_dir + "/camera_intrinsic_" + sensor_id + ".yaml";
     {
         std::ofstream f(yaml_path);
-        f << out;
-        UNICALIB_INFO("Saved: {}", yaml_path);
+        if (!f.is_open()) {
+            UNICALIB_ERROR("无法写入结果文件: {}", yaml_path);
+        } else {
+            f << out;
+            UNICALIB_INFO("Saved: {}", yaml_path);
+        }
     }
+
+    // 精度记录到 CSV，便于绘制曲线
+    std::map<std::string, std::string> extra;
+    extra["num_images"] = std::to_string(intrin.num_images_used);
+    append_calib_accuracy(output_dir, CalibAccuracyTask::CAM_INTRINSIC,
+        true, intrin.rms_reproj_error, elapsed_ms, extra);
 
     // 打印摘要
     std::cout << "\n┌────────────────────────────────────────────────┐\n";
@@ -235,5 +261,5 @@ int main(int argc, char** argv) {
     std::cout << "└──────────────────────┴──────────────────────────┘\n";
     std::cout << "\n结果保存至: " << yaml_path << "\n\n";
 
-    return 0;
+    UNICALIB_MAIN_TRY_END(0)
 }

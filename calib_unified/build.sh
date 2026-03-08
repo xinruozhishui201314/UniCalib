@@ -6,8 +6,12 @@
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 项目根目录的 logs（编译/运行日志统一写入此处并带时间戳）
+REPO_LOGS_DIR="${REPO_LOGS_DIR:-$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)/logs}"
+mkdir -p "$REPO_LOGS_DIR"
 BUILD_DIR="${SCRIPT_DIR}/build"
 INSTALL_DIR="${SCRIPT_DIR}/install"
+BUILD_LOG_FILE="${REPO_LOGS_DIR}/build_$(date +%Y%m%d_%H%M%S).log"
 
 # 颜色输出
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -152,14 +156,15 @@ fi
 cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" "${CMAKE_ARGS[@]}"
 
 # ---------------------------------------------------------------------------
-# 编译
+# 编译（同时写入项目 logs/ 下带时间戳的编译日志）
 # ---------------------------------------------------------------------------
 info "开始编译 (jobs=$JOBS) ..."
+info "编译日志: ${BUILD_LOG_FILE}"
 
 if [ "$VERBOSE" -eq 1 ]; then
-    cmake --build "$BUILD_DIR" -j"$JOBS" --verbose
+    cmake --build "$BUILD_DIR" -j"$JOBS" --verbose 2>&1 | tee "$BUILD_LOG_FILE"
 else
-    cmake --build "$BUILD_DIR" -j"$JOBS" 2>&1 | tee "${BUILD_DIR}/build.log" | \
+    { cmake --build "$BUILD_DIR" -j"$JOBS" 2>&1 | tee "${BUILD_DIR}/build.log" | tee "$BUILD_LOG_FILE"; } | \
         grep -E "error:|warning:|undefined|^\[" | head -50
 fi
 
@@ -203,6 +208,7 @@ if [ "$ALL_OK" -eq 1 ]; then
     info "========== 编译成功 =========="
     echo ""
     echo "可执行文件位于: ${BUILD_DIR}/bin/"
+    echo "编译完整日志: ${BUILD_LOG_FILE}"
     echo ""
     echo "快速测试:"
     echo "  ${BUILD_DIR}/bin/unicalib_imu_intrinsic --help"
@@ -212,6 +218,7 @@ if [ "$ALL_OK" -eq 1 ]; then
 else
     warn "========== 部分编译失败, 请检查错误日志 =========="
     echo "日志文件: ${BUILD_DIR}/build.log"
+    echo "项目日志: ${BUILD_LOG_FILE}"
 fi
 
 # ---------------------------------------------------------------------------

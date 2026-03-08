@@ -121,6 +121,11 @@ public:
 
         // 是否执行 iKalibr 联合 B样条精化 (需要足够数据)
         bool do_joint_bspline_refine = true;
+        /** Phase3 轨迹对应的外参：仅更新此前缀的外参（避免多外参时误覆盖）。
+         *  若均非空则只更新 get_extrinsic(phase3_extrinsic_ref_id, phase3_extrinsic_target_id)；
+         *  若均为空且当前仅 1 个外参则更新该唯一外参；否则不写回。 */
+        std::string phase3_extrinsic_ref_id;
+        std::string phase3_extrinsic_target_id;
 
         // IMU 内参配置
         IMUIntrinsicCalibrator::Config imu_intrin_cfg;

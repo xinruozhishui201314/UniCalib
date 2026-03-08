@@ -407,10 +407,10 @@ std::optional<ExtrinsicSE3> ManualClickRefiner::optimize_from_clicks(
 
     // 构建结果
     ExtrinsicSE3 result = init_extrin;
-    Eigen::AngleAxisd aa_result(
-        std::sqrt(rot[0]*rot[0] + rot[1]*rot[1] + rot[2]*rot[2]),
-        Eigen::Vector3d(rot[0], rot[1], rot[2]).normalized());
-    result.SO3_TargetInRef = Sophus::SO3d(aa_result.toRotationMatrix());
+    Eigen::Vector3d rv(rot[0], rot[1], rot[2]);
+    result.SO3_TargetInRef = (rv.norm() < 1e-10)
+        ? Sophus::SO3d()
+        : Sophus::SO3d(Eigen::AngleAxisd(rv.norm(), rv.normalized()));
     result.POS_TargetInRef = Eigen::Vector3d(trans[0], trans[1], trans[2]);
     result.residual_rms = std::sqrt(summary.final_cost / clicks.size());
     result.is_converged = true;

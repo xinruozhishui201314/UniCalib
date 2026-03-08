@@ -370,15 +370,13 @@ private:
         }
     }
     
-    // 估算 CPU 使用率（简化版，实际需要平台相关实现）
+    // 估算 CPU 使用率（占位：平台相关实现可读 /proc/self/stat 或 GetProcessTimes 等）
     double estimateCPUUsage(const std::string& /*name*/) const {
-        // TODO: 实现实际的 CPU 使用率测量
         return 0.0;
     }
     
-    // 估算内存使用（简化版）
+    // 估算内存使用（占位：平台相关实现可读 /proc/self/status 或 GetProcessMemoryInfo 等）
     size_t estimateMemoryUsage(const std::string& /*name*/) const {
-        // TODO: 实现实际的内存使用测量
         return 0;
     }
 };

@@ -12,6 +12,7 @@
  *   unicalib_cam_cam --config <config.yaml> --manual
  */
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include "unicalib/pipeline/calib_pipeline.h"
 #include "unicalib/pipeline/manual_calib.h"
 #include "unicalib/extrinsic/cam_cam_calib.h"
@@ -82,9 +83,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fs::create_directories(output_dir + "/logs");
+    UNICALIB_MAIN_TRY_BEGIN
+
+    std::string logs_dir = resolve_logs_dir(output_dir);
+    std::string log_file = logs_dir + "/cam_cam_" + log_timestamp_filename() + ".log";
     Logger::init("Cam-Cam",
-                 output_dir + "/logs/cam_cam_calib.log",
+                 log_file,
                  log_level == "debug" ? spdlog::level::debug :
                  log_level == "trace" ? spdlog::level::trace :
                  log_level == "warn"  ? spdlog::level::warn  :
@@ -165,5 +169,5 @@ int main(int argc, char** argv) {
     report.print_summary();
 
     UNICALIB_INFO("Cam-Cam 标定完成 | 结果: {}", output_dir);
-    return 0;
+    UNICALIB_MAIN_TRY_END(0)
 }

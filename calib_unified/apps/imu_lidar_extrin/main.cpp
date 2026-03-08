@@ -12,6 +12,7 @@
  *   unicalib_imu_lidar --config <config.yaml> --manual
  */
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include "unicalib/pipeline/calib_pipeline.h"
 #include "unicalib/pipeline/ai_coarse_calib.h"
 #include "unicalib/pipeline/manual_calib.h"
@@ -86,9 +87,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fs::create_directories(output_dir + "/logs");
+    UNICALIB_MAIN_TRY_BEGIN
+
+    std::string logs_dir = resolve_logs_dir(output_dir);
+    std::string log_file = logs_dir + "/imu_lidar_" + log_timestamp_filename() + ".log";
     Logger::init("IMU-LiDAR",
-                 output_dir + "/logs/imu_lidar_calib.log",
+                 log_file,
                  log_level == "debug" ? spdlog::level::debug :
                  log_level == "trace" ? spdlog::level::trace :
                  log_level == "warn"  ? spdlog::level::warn  :
@@ -194,5 +198,5 @@ int main(int argc, char** argv) {
     report.print_summary();
 
     UNICALIB_INFO("IMU-LiDAR 标定完成 | 结果: {}", output_dir);
-    return 0;
+    UNICALIB_MAIN_TRY_END(0)
 }

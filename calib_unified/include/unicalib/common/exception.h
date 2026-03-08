@@ -259,7 +259,10 @@ inline std::unique_ptr<UniCalibException> createException(
 // ===================================================================
 
 #define UNICALIB_THROW(code, msg) \
-    throw ::ns_unicalib::createException(code, msg, __FILE__, __LINE__, __func__)
+    do { \
+        auto _unicalib_e = ::ns_unicalib::createException(code, msg, __FILE__, __LINE__, __func__); \
+        throw *_unicalib_e; \
+    } while(0)
 
 #define UNICALIB_THROW_IF(cond, code, msg) \
     do { \
@@ -296,5 +299,34 @@ inline std::unique_ptr<UniCalibException> createException(
 #define UNICALIB_CHECK_NONEMPTY(container, msg) \
     UNICALIB_THROW_IF((container).empty(), \
                       ::ns_unicalib::ErrorCode::EMPTY_DATA, msg)
+
+// ===================================================================
+// 主程序异常报告（实现在 exception_report.cpp，避免头文件依赖 logger）
+// ===================================================================
+void reportUnhandledUniCalibException(const UniCalibException& e);
+void reportUnhandledStdException(const std::exception& e);
+void reportUnhandledUnknownException();
+
+// ===================================================================
+// 主程序异常捕获 — 避免未捕获异常导致进程崩溃，精确定位问题
+// ===================================================================
+#define UNICALIB_MAIN_TRY_BEGIN \
+    try {
+
+#define UNICALIB_MAIN_TRY_END(exitsuccess) \
+    } \
+    catch (const ::ns_unicalib::UniCalibException& e) { \
+        ::ns_unicalib::reportUnhandledUniCalibException(e); \
+        return static_cast<int>(e.codeValue() != 0 ? (e.codeValue() % 256) : 1); \
+    } \
+    catch (const std::exception& e) { \
+        ::ns_unicalib::reportUnhandledStdException(e); \
+        return 2; \
+    } \
+    catch (...) { \
+        ::ns_unicalib::reportUnhandledUnknownException(); \
+        return 3; \
+    } \
+    return (exitsuccess)
 
 }  // namespace ns_unicalib

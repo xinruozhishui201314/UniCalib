@@ -518,9 +518,11 @@ set(IKALIBR_LOADER_SOURCES
 
 # UniCalib 新增统一接口源文件
 set(UNICALIB_NEW_SOURCES
-    # 公共数据结构
+    # 公共数据结构与异常报告
     src/common/sensor_types.cpp
     src/common/calib_param.cpp
+    src/common/exception_report.cpp
+    src/common/accuracy_logger.cpp
     # 内参标定
     src/intrinsic/allan_variance.cpp
     src/intrinsic/camera_pinhole_calib.cpp

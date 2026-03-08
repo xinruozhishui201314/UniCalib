@@ -245,10 +245,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // ─── 初始化日志 ───────────────────────────────────────────────────
-    fs::create_directories(output_dir + "/logs");
+    UNICALIB_MAIN_TRY_BEGIN
+
+    // ─── 初始化日志（写入 logs 目录，文件名带时间戳）───────────────────
+    std::string logs_dir = resolve_logs_dir(output_dir);
+    std::string log_file = logs_dir + "/joint_calib_" + log_timestamp_filename() + ".log";
     Logger::init("Joint-Calib",
-                 output_dir + "/logs/joint_calib.log",
+                 log_file,
                  log_level == "debug" ? spdlog::level::debug :
                  log_level == "trace" ? spdlog::level::trace :
                  log_level == "warn"  ? spdlog::level::warn  :
@@ -438,5 +441,6 @@ int main(int argc, char** argv) {
         UNICALIB_WARN("  或直接调用 ManualCalibSession::run_*() API");
     }
 
-    return report.all_converged() ? 0 : 1;
+    int exit_code = report.all_converged() ? 0 : 1;
+    UNICALIB_MAIN_TRY_END(exit_code)
 }

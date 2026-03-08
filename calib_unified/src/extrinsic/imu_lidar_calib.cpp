@@ -8,6 +8,7 @@
 
 #include "unicalib/extrinsic/imu_lidar_calib.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include "unicalib/common/math_safety.h"
 #include "ikalibr/core/lidar_odometer.h"
 #include "ikalibr/sensor/lidar.h"
@@ -18,6 +19,7 @@
 #include <numeric>
 #include <ceres/ceres.h>
 #include <basalt/spline/se3_spline.h>
+#include <basalt/utils/sophus_utils.hpp>
 #include <cmath>
 
 namespace ns_unicalib {
@@ -52,6 +54,7 @@ std::optional<ExtrinsicSE3> IMULiDARCalibrator::calibrate(
     UNICALIB_INFO("  IMU 数据: {} 帧", imu_data.size());
     UNICALIB_INFO("  LiDAR 数据: {} 帧", lidar_scans.size());
 
+    try {
     // Step 1: 运行 LiDAR 里程计
     if (!run_lidar_odometry(lidar_scans)) {
         UNICALIB_ERROR("[IMU-LiDAR] LiDAR 里程计失败");
@@ -95,6 +98,18 @@ std::optional<ExtrinsicSE3> IMULiDARCalibrator::calibrate(
                   extrinsic.POS_TargetInRef.z());
 
     return extrinsic;
+
+    } catch (const UniCalibException& e) {
+        UNICALIB_ERROR("[IMU-LiDAR] 标定异常 [{}]: {} ({}:{})",
+                       errorCodeName(e.code()), e.message(), e.file(), e.line());
+        return std::nullopt;
+    } catch (const std::exception& e) {
+        UNICALIB_ERROR("[IMU-LiDAR] 标定异常: {}", e.what());
+        return std::nullopt;
+    } catch (...) {
+        UNICALIB_ERROR("[IMU-LiDAR] 标定未知异常");
+        return std::nullopt;
+    }
 }
 
 // ===================================================================
@@ -340,7 +355,7 @@ std::optional<Sophus::SO3d> IMULiDARCalibrator::solve_handeye_rotation(
         return std::nullopt;
     }
 
-    UNICALIB_INFO("[Handeye] 开始手眼标定， 共 {} 对", pairs.size());
+    UNICALIB_INFO("[IMU-LiDAR] 步骤: 手眼旋转标定开始 — 旋转对 {} 个", pairs.size());
 
     // 使用 SVD 求解手眼方程 AX = XB
     // 对于 IMU-LiDAR 手眼标定，方程形式为: R_imu * X = X * R_lidar
@@ -439,7 +454,7 @@ std::optional<Sophus::SO3d> IMULiDARCalibrator::solve_handeye_rotation(
     }
     double avg_error_deg = MathSafety::radToDeg(total_error / N);
     
-    UNICALIB_INFO("[Handeye] 旋转标定完成， 平均误差: {:.4f} deg", avg_error_deg);
+    UNICALIB_INFO("[IMU-LiDAR] 步骤: 手眼旋转标定完成 — 平均误差: {:.4f} deg", avg_error_deg);
     
     if (avg_error_deg > 10.0) {
         UNICALIB_WARN("[Handeye] 平均误差较大，建议检查数据质量");
@@ -463,6 +478,7 @@ std::optional<Eigen::Vector3d> IMULiDARCalibrator::estimate_translation(
         return std::nullopt;
     }
 
+    UNICALIB_INFO("[IMU-LiDAR] 步骤: 平移估计开始 (里程计 {} 帧)", lidar_odom_.size());
     // 阈值参数
     constexpr double MIN_VELOCITY = 0.1;       // 最小速度 [m/s]
     constexpr double MIN_GYRO = 0.05;          // 最小角速度 [rad/s]
@@ -625,7 +641,8 @@ std::optional<Eigen::Vector3d> IMULiDARCalibrator::estimate_translation(
     }
     rms_error = std::sqrt(rms_error / filtered.size());
 
-    UNICALIB_INFO("[Trans-Est] 平移估计完成:");
+    UNICALIB_INFO("[IMU-LiDAR] 步骤: 平移估计完成 — t=[{:.3f}, {:.3f}, {:.3f}] m, RMS={:.4f} m/s",
+                  t_final.x(), t_final.y(), t_final.z(), rms_error);
     UNICALIB_INFO("  t = [{:.3f}, {:.3f}, {:.3f}] m", t_final.x(), t_final.y(), t_final.z());
     UNICALIB_INFO("  RMS 误差 = {:.4f} m/s (基于 {} 个约束)", rms_error, filtered.size());
 
@@ -661,7 +678,8 @@ Sophus::SE3d interpolate_pose(
     return Sophus::SE3d(R, p);
 }
 
-// Ceres 代价: 外参(6) + 时间偏移(1) vs 固定 B 样条与 LiDAR 位姿，使用 double 便于数值微分
+// Ceres 代价: 外参(6) + 时间偏移(1) vs 固定 B 样条与 LiDAR 位姿
+// 使用 basalt-headers 的 pose() 与 d_pose_d_t() 提供精确（解析）雅可比，替代数值微分
 struct SplineExtrinsicCost {
     const basalt::Se3Spline<4>* spline;
     int64_t t_lidar_ns;
@@ -683,6 +701,80 @@ struct SplineExtrinsicCost {
         return true;
     }
 };
+
+// 解析雅可比代价函数：基于 basalt-headers 的 d_pose_d_t 实现精确估计
+// 残差对 外参(6) 与 时间偏移(1) 的导数由解析公式给出，避免数值微分误差
+class SplineExtrinsicAnalyticCost : public ceres::CostFunction {
+ public:
+    SplineExtrinsicAnalyticCost(const basalt::Se3Spline<4>* spline,
+                                int64_t t_lidar_ns,
+                                const Sophus::SE3d& T_w_lidar)
+        : spline_(spline), t_lidar_ns_(t_lidar_ns), T_w_lidar_(T_w_lidar) {
+        set_num_residuals(6);
+        mutable_parameter_block_sizes()->push_back(6);   // extr
+        mutable_parameter_block_sizes()->push_back(1);   // time_offset
+    }
+
+    bool Evaluate(double const* const* parameters,
+                  double* residuals,
+                  double** jacobians) const override {
+        const double* extr = parameters[0];
+        const double dt = parameters[1][0];
+        Eigen::Map<const Eigen::Vector3d> rot_vec(extr);
+        Eigen::Map<const Eigen::Vector3d> trans(extr + 3);
+
+        const int64_t t_query_ns = t_lidar_ns_ + static_cast<int64_t>(1e9 * dt);
+        Sophus::SE3d T_w_imu = spline_->pose(t_query_ns);
+        Sophus::SE3d T_imu_lidar(Sophus::SO3d::exp(rot_vec), trans);
+        Sophus::SE3d T_w_lidar_pred = T_w_imu * T_imu_lidar;
+        Sophus::SE3d T_err = T_w_lidar_pred.inverse() * T_w_lidar_;
+        Eigen::Map<Eigen::Matrix<double, 6, 1>> r(residuals);
+        r = T_err.log();
+
+        if (!jacobians) return true;
+
+        // 使用 basalt 的 decoupled SE(3) 右雅可比逆: r = log(T_err), dr/d(eps_pred) = -J_r^{-1}(r)
+        Eigen::Matrix<double, 6, 6> J_r_inv;
+        Sophus::rightJacobianInvSE3Decoupled(r, J_r_inv);
+        // 外参 extr = [rot_vec(3), trans(3)]，T_imu_lidar = (exp(rot_vec), trans)，decoupled tangent phi = (trans, rot_vec)
+        // d(phi)/d(extr) = [0 I; I 0]，且 tangent_pred (body) = Ad(T_imu_lidar^{-1}) * phi_imu_lidar
+        Eigen::Matrix<double, 6, 6> d_phi_imu_lidar_d_extr;
+        d_phi_imu_lidar_d_extr.setZero();
+        d_phi_imu_lidar_d_extr.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity();
+        d_phi_imu_lidar_d_extr.block<3, 3>(3, 0) = Eigen::Matrix3d::Identity();
+        Eigen::Matrix<double, 6, 6> Ad_inv = T_imu_lidar.inverse().Adj();
+        Eigen::Matrix<double, 6, 6> d_res_d_extr =
+            -J_r_inv * Ad_inv * d_phi_imu_lidar_d_extr;
+
+        if (jacobians[0]) {
+            Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> J_extr(jacobians[0]);
+            J_extr = d_res_d_extr;
+        }
+
+        // d(residual)/d(time_offset): d(residual)/d(dt) = d(residual)/d(T_pred) * d(T_pred)/d(t) * 1e9
+        // basalt: d_pose_d_t 给出 body 系角速度与线速度 (omega, v_body)
+        if (jacobians[1]) {
+            Eigen::Matrix<double, 6, 1> d_pose_d_t;
+            spline_->d_pose_d_t(t_query_ns, d_pose_d_t);
+            // T_pred 对 t 的导数 (在 T_w_imu 处): d(T_w_imu)/dt = T_w_imu * [omega_body; v_body] (右扰动)
+            // 在 T_pred 的 body 系: d(T_pred)/d(t) = T_imu_lidar^{-1}.Adj() * d_pose_d_t
+            Eigen::Matrix<double, 6, 1> tangent_pred = T_imu_lidar.inverse().Adj() * d_pose_d_t;
+            Eigen::Matrix<double, 6, 1> d_res_d_t = -J_r_inv * tangent_pred * 1e9;
+            jacobians[1][0] = d_res_d_t(0);
+            jacobians[1][1] = d_res_d_t(1);
+            jacobians[1][2] = d_res_d_t(2);
+            jacobians[1][3] = d_res_d_t(3);
+            jacobians[1][4] = d_res_d_t(4);
+            jacobians[1][5] = d_res_d_t(5);
+        }
+        return true;
+    }
+
+ private:
+    const basalt::Se3Spline<4>* spline_;
+    int64_t t_lidar_ns_;
+    Sophus::SE3d T_w_lidar_;
+};
 }  // namespace
 
 // ===================================================================
@@ -697,6 +789,7 @@ ExtrinsicSE3 IMULiDARCalibrator::refine_with_spline(
     const std::string& lidar_id,
     const IMUIntrinsics* imu_intrin) {
 
+    UNICALIB_INFO("[IMU-LiDAR] 步骤: B样条精细优化开始 (LiDAR {} 帧)", lidar_scans.size());
     ExtrinsicSE3 result;
     result.ref_sensor_id = imu_id;
     result.target_sensor_id = lidar_id;
@@ -758,8 +851,7 @@ ExtrinsicSE3 IMULiDARCalibrator::refine_with_spline(
         if (t_ns < spline.minTimeNs() || t_ns > spline.maxTimeNs())
             continue;
         ceres::CostFunction* cost =
-            new ceres::NumericDiffCostFunction<SplineExtrinsicCost, ceres::CENTRAL, 6, 6, 1>(
-                new SplineExtrinsicCost{&spline, t_ns, lidar_odom_[i].second});
+            new SplineExtrinsicAnalyticCost(&spline, t_ns, lidar_odom_[i].second);
         problem.AddResidualBlock(cost, loss, extr, &time_offset_s);
     }
 
@@ -781,7 +873,7 @@ ExtrinsicSE3 IMULiDARCalibrator::refine_with_spline(
     result.time_offset_s = time_offset_s;
     result.is_converged = (summary.termination_type == ceres::CONVERGENCE);
 
-    UNICALIB_INFO("[B-spline] 精化完成: time_offset={:.4f}s converged={}",
+    UNICALIB_INFO("[IMU-LiDAR] 步骤: B样条精细优化完成 — time_offset={:.4f}s converged={}",
                   result.time_offset_s, result.is_converged ? "yes" : "no");
 
     return result;
@@ -791,11 +883,14 @@ ExtrinsicSE3 IMULiDARCalibrator::refine_with_spline(
 // 手动校准验证
 // ===================================================================
 ExtrinsicSE3 IMULiDARCalibrator::calibrate_manual_verify(
-    const std::vector<IMUFrame>& imu_data,
-    const std::vector<LiDARScan>& lidar_scans,
+    const std::vector<IMUFrame>& /*imu_data*/,
+    const std::vector<LiDARScan>& /*lidar_scans*/,
     const ExtrinsicSE3& init_extrin) {
-    // TODO: 实现手动验证
-    return init_extrin;
+    // 最小实现：返回初值并打日志。完整实现需可视化旋转对比 + 增量调整或单步 B 样条 refine。
+    UNICALIB_INFO("[IMU-LiDAR] calibrate_manual_verify: 使用初值（完整手动验证 TODO）");
+    ExtrinsicSE3 out = init_extrin;
+    out.is_converged = false;  // 未做验证步骤，不标记为已收敛
+    return out;
 }
 
 }  // namespace ns_unicalib

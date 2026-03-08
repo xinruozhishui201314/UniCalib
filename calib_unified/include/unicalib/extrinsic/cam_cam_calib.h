@@ -80,6 +80,9 @@ public:
         double ba_huber_loss = 2.0;
         double ba_min_track_len = 3;    // 最短特征轨迹长度
         bool   ba_optimize_intrinsics = false;
+        bool   use_full_multiview_ba = true;  // 多相机时使用完整多视图 BA（全局联合优化）
+        size_t ba_min_tracks_multiview = 20;  // 多视图 BA 最少轨迹数，不足则退回两两标定
+        size_t ba_min_points_multiview = 10; // 多视图 BA 三角化最少有效点数
 
         // 尺度约束 (参考: "Solving for Relative Pose with Constraints", CVPR 2014)
         // 通过已知距离 (如棋盘格尺寸) 消除尺度不确定性
@@ -169,8 +172,23 @@ public:
         const std::string& cam1_id = "cam_1");
 
     // 方法 C: Bundle Adjustment
-    // 支持多相机 (N ≥ 2)
+    // 支持多相机 (N ≥ 2)，当前为两两标定 (cam0 为参考)
     std::vector<ExtrinsicSE3> calibrate_bundle_adjustment(
+        const std::vector<std::vector<std::pair<double, cv::Mat>>>& frames_per_cam,
+        const std::vector<CameraIntrinsics>& intrinsics,
+        const std::vector<std::string>& cam_ids);
+
+    // 方法 C': 完整多视图 Bundle Adjustment（全局联合优化）
+    // 单次 Ceres 问题：所有外参 T_cam0_cami + 所有 3D 点，最小化全部重投影误差
+    // 要求: 多相机、多帧、跨相机特征轨迹，适合标定 cam0-cam1-cam2-... 外参
+    struct MultiViewBAResult {
+        std::vector<ExtrinsicSE3> extrinsics;  // cam0 为参考，extrinsics[i] = T_cam0_cam(i+1)
+        double final_cost = 0.0;
+        int num_points = 0;
+        int num_observations = 0;
+        bool converged = false;
+    };
+    MultiViewBAResult calibrate_bundle_adjustment_full_multiview(
         const std::vector<std::vector<std::pair<double, cv::Mat>>>& frames_per_cam,
         const std::vector<CameraIntrinsics>& intrinsics,
         const std::vector<std::string>& cam_ids);
@@ -225,6 +243,12 @@ private:
         const Sophus::SE3d& init_T,
         const std::string& cam0_id,
         const std::string& cam1_id);
+
+    // 仅两两标定（供多视图 BA 失败时回退，避免递归）
+    std::vector<ExtrinsicSE3> calibrate_bundle_adjustment_pairwise_only(
+        const std::vector<std::vector<std::pair<double, cv::Mat>>>& frames_per_cam,
+        const std::vector<CameraIntrinsics>& intrinsics,
+        const std::vector<std::string>& cam_ids);
 };
 
 }  // namespace ns_unicalib

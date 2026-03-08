@@ -8,6 +8,7 @@
 
 #include "unicalib/extrinsic/cam_cam_calib.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
 #include "unicalib/common/math_safety.h"  // 修复：添加数学安全工具库
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
@@ -48,6 +49,7 @@ std::vector<FeatureMatch> CamCamCalibrator::match_features(
     const CameraIntrinsics& /*intrin0*/,
     const CameraIntrinsics& /*intrin1*/) {
 
+    UNICALIB_DEBUG("[Cam-Cam] 步骤: 特征提取与匹配");
     std::vector<FeatureMatch> matches;
 
     cv::Mat gray0, gray1;
@@ -158,6 +160,7 @@ bool CamCamCalibrator::recover_pose_from_E(
     cv::cv2eigen(t_cv, t_eig);
     rot   = Sophus::SO3d(R_eig);
     trans = t_eig;
+    UNICALIB_INFO("[Cam-Cam] 步骤: 本质矩阵恢复位姿完成 (内点 {})", inliers.rows);
     return true;
 }
 
@@ -339,6 +342,7 @@ ExtrinsicSE3 CamCamCalibrator::bundle_adjustment_two_views(
         return result;
     }
 
+    UNICALIB_INFO("[Cam-Cam] 步骤: Bundle Adjustment 开始 (匹配点 {})", matches.size());
     // 三角化
     cv::Mat K0 = (cv::Mat_<double>(3,3) <<
         intrin0.fx, 0, intrin0.cx, 0, intrin0.fy, intrin0.cy, 0, 0, 1);
@@ -373,15 +377,16 @@ ExtrinsicSE3 CamCamCalibrator::bundle_adjustment_two_views(
     int n_invalid_depth = 0;
     int n_invalid_proj = 0;
     
+    const bool pts4d_is_f64 = (pts4d.type() == CV_64FC1);
     for (int i = 0; i < pts4d.cols; ++i) {
-        float w = pts4d.at<float>(3,i);
+        double w = pts4d_is_f64 ? pts4d.at<double>(3, i) : static_cast<double>(pts4d.at<float>(3, i));
         if (std::abs(w) < 1e-6) {
             ++n_invalid_depth;
             continue;
         }
-        float x = pts4d.at<float>(0,i)/w;
-        float y = pts4d.at<float>(1,i)/w;
-        float z = pts4d.at<float>(2,i)/w;
+        double x = (pts4d_is_f64 ? pts4d.at<double>(0, i) : static_cast<double>(pts4d.at<float>(0, i))) / w;
+        double y = (pts4d_is_f64 ? pts4d.at<double>(1, i) : static_cast<double>(pts4d.at<float>(1, i))) / w;
+        double z = (pts4d_is_f64 ? pts4d.at<double>(2, i) : static_cast<double>(pts4d.at<float>(2, i))) / w;
         
         // 深度范围检查
         if (z < 0.1 || z > 200.0) {
@@ -448,16 +453,26 @@ ExtrinsicSE3 CamCamCalibrator::bundle_adjustment_two_views(
                          cfg_.known_baseline_scale, cfg_.scale_constraint_weight);
         }
         
-        ceres::Solver::Summary summary;
-        ceres::Solve(opt, &problem, &summary);
-        UNICALIB_INFO("  BA: n_valid={} {}", n_valid, summary.BriefReport());
+        try {
+            ceres::Solver::Summary summary;
+            ceres::Solve(opt, &problem, &summary);
+            UNICALIB_INFO("  BA: n_valid={} {}", n_valid, summary.BriefReport());
+        } catch (const std::exception& e) {
+            UNICALIB_ERROR("[Cam-Cam] Ceres BA 求解异常: {}", e.what());
+            result.is_converged = false;
+            return result;
+        }
     }
 
     Eigen::Vector3d rv2(pose[0], pose[1], pose[2]);
-    Eigen::AngleAxisd aa(rv2.norm(), rv2.normalized());
-    result.SO3_TargetInRef  = Sophus::SO3d(aa.toRotationMatrix());
+    if (rv2.norm() < 1e-10)
+        result.SO3_TargetInRef = Sophus::SO3d();
+    else
+        result.SO3_TargetInRef = Sophus::SO3d(Eigen::AngleAxisd(rv2.norm(), rv2.normalized()));
     result.POS_TargetInRef  = Eigen::Vector3d(pose[3], pose[4], pose[5]);
     result.is_converged     = (n_valid >= 10);
+    UNICALIB_INFO("[Cam-Cam] 步骤: Bundle Adjustment 完成 (有效点 {} converged={})",
+                  n_valid, result.is_converged ? "yes" : "no");
     return result;
 }
 
@@ -475,7 +490,30 @@ std::vector<ExtrinsicSE3> CamCamCalibrator::calibrate_bundle_adjustment(
     std::vector<ExtrinsicSE3> results;
     if (cam_ids.size() < 2) return results;
 
-    // 两两标定 (以 cam_ids[0] 为参考)
+    // 多相机且启用时，优先完整多视图 BA（全局联合优化）
+    if (cfg_.use_full_multiview_ba && cam_ids.size() >= 2) {
+        auto full = calibrate_bundle_adjustment_full_multiview(
+            frames_per_cam, intrinsics, cam_ids);
+        if (!full.extrinsics.empty()) {
+            UNICALIB_INFO("  [多视图 BA] 使用全局优化结果 (点 {} 观测 {} converged={})",
+                          full.num_points, full.num_observations, full.converged ? "yes" : "no");
+            return full.extrinsics;
+        }
+        UNICALIB_WARN("  [多视图 BA] 未得到结果，退回两两标定");
+    }
+
+    return calibrate_bundle_adjustment_pairwise_only(
+        frames_per_cam, intrinsics, cam_ids);
+}
+
+std::vector<ExtrinsicSE3> CamCamCalibrator::calibrate_bundle_adjustment_pairwise_only(
+    const std::vector<std::vector<std::pair<double, cv::Mat>>>& frames_per_cam,
+    const std::vector<CameraIntrinsics>& intrinsics,
+    const std::vector<std::string>& cam_ids) {
+
+    std::vector<ExtrinsicSE3> results;
+    if (cam_ids.size() < 2) return results;
+
     for (size_t i = 1; i < cam_ids.size(); ++i) {
         const auto& f0 = frames_per_cam[0];
         const auto& f1 = frames_per_cam[i];
@@ -490,7 +528,6 @@ std::vector<ExtrinsicSE3> CamCamCalibrator::calibrate_bundle_adjustment(
         }
         UNICALIB_INFO("  cam0 <-> cam{}: {} 匹配", i, all_matches.size());
 
-        // 初值
         Sophus::SO3d rot;
         Eigen::Vector3d trans;
         Sophus::SE3d init_T;
@@ -503,8 +540,281 @@ std::vector<ExtrinsicSE3> CamCamCalibrator::calibrate_bundle_adjustment(
             init_T, cam_ids[0], cam_ids[i]);
         results.push_back(ext);
     }
-
     return results;
+}
+
+// ===================================================================
+// 完整多视图 BA：跨相机轨迹 + 全局 Ceres 优化
+// ===================================================================
+namespace {
+// 单次观测：(相机 id, 像素 u, v)
+struct Obs {
+    int cam_id;
+    double u, v;
+};
+// 轨迹：同一 3D 点在多相机中的观测
+using Track = std::vector<Obs>;
+
+// 多视图重投影代价：X 在 cam0 系，T_cam0_cami 为 cam_i 在 cam0 下的位姿，则 p_cami = T_cam0_cami^{-1} * X = R^T*(X-t)
+struct MultiViewReprojectCost {
+    double obs_u, obs_v;
+    double fx, fy, cx, cy;
+    MultiViewReprojectCost(double u, double v, double _fx, double _fy, double _cx, double _cy)
+        : obs_u(u), obs_v(v), fx(_fx), fy(_fy), cx(_cx), cy(_cy) {}
+    template <typename T>
+    bool operator()(const T* const T_cam0_cami, const T* const X, T* res) const {
+        const T* aa = T_cam0_cami;
+        const T* t = T_cam0_cami + 3;
+        T d[3] = { X[0] - t[0], X[1] - t[1], X[2] - t[2] };
+        T inv_aa[3] = { -aa[0], -aa[1], -aa[2] };
+        T p_cami[3];
+        ceres::AngleAxisRotatePoint(inv_aa, d, p_cami);
+        T zi = T(1.0) / p_cami[2];
+        res[0] = T(fx) * p_cami[0] * zi + T(cx) - T(obs_u);
+        res[1] = T(fy) * p_cami[1] * zi + T(cy) - T(obs_v);
+        return true;
+    }
+    static ceres::CostFunction* Create(double u, double v,
+                                      double fx, double fy, double cx, double cy) {
+        return new ceres::AutoDiffCostFunction<MultiViewReprojectCost, 2, 6, 3>(
+            new MultiViewReprojectCost(u, v, fx, fy, cx, cy));
+    }
+};
+}  // namespace
+
+CamCamCalibrator::MultiViewBAResult CamCamCalibrator::calibrate_bundle_adjustment_full_multiview(
+    const std::vector<std::vector<std::pair<double, cv::Mat>>>& frames_per_cam,
+    const std::vector<CameraIntrinsics>& intrinsics,
+    const std::vector<std::string>& cam_ids) {
+
+    MultiViewBAResult out;
+    if (cam_ids.size() < 2) return out;
+    if (intrinsics.size() < cam_ids.size()) {
+        UNICALIB_WARN("[FullMultiViewBA] intrinsics.size() ({}) < cam_ids.size() ({})",
+                      intrinsics.size(), cam_ids.size());
+        return out;
+    }
+
+    UNICALIB_INFO("=== Camera-Camera 完整多视图 BA ({} 相机) ===", cam_ids.size());
+
+    const size_t num_cams = cam_ids.size();
+    const size_t num_frames = frames_per_cam.empty() ? 0 : frames_per_cam[0].size();
+
+    if (num_frames == 0) {
+        UNICALIB_WARN("[FullMultiViewBA] 无帧数据");
+        return out;
+    }
+    for (size_t c = 0; c < num_cams; ++c) {
+        if (frames_per_cam[c].size() < num_frames) {
+            UNICALIB_WARN("[FullMultiViewBA] cam{} 帧数不足", c);
+            return out;
+        }
+    }
+
+    // 1) 提取每相机关键点与描述子（使用第一帧或中间帧）
+    const size_t frame_idx = num_frames / 2;
+    std::vector<std::vector<cv::KeyPoint>> kps(num_cams);
+    std::vector<cv::Mat> descs(num_cams);
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(cfg_.num_features, 1.2f, 8, 31, 0, 2,
+                                           cv::ORB::HARRIS_SCORE, 31, 20);
+    for (size_t c = 0; c < num_cams; ++c) {
+        cv::Mat gray;
+        if (frames_per_cam[c][frame_idx].second.channels() == 3)
+            cv::cvtColor(frames_per_cam[c][frame_idx].second, gray, cv::COLOR_BGR2GRAY);
+        else
+            gray = frames_per_cam[c][frame_idx].second;
+        orb->detectAndCompute(gray, cv::noArray(), kps[c], descs[c]);
+    }
+
+    // 2) 两两匹配并构建轨迹（cam0 与 cam_i 匹配，再按 cam0 的 idx 合并）
+    std::vector<std::map<int, int>> cam0_to_cami(num_cams);
+    for (size_t i = 1; i < num_cams; ++i) {
+        if (descs[0].empty() || descs[i].empty()) continue;
+        cv::BFMatcher bf(cv::NORM_HAMMING, false);
+        std::vector<cv::DMatch> matches;
+        bf.match(descs[0], descs[i], matches);
+        for (const auto& m : matches) {
+            if (m.distance > 80) continue;
+            cam0_to_cami[i][m.queryIdx] = m.trainIdx;
+        }
+    }
+    std::vector<Track> tracks;
+    for (const auto& pair01 : cam0_to_cami[1]) {
+        int idx0 = pair01.first;
+        int idx1 = pair01.second;
+        Track tr;
+        tr.push_back({0, static_cast<double>(kps[0][idx0].pt.x), static_cast<double>(kps[0][idx0].pt.y)});
+        tr.push_back({1, static_cast<double>(kps[1][idx1].pt.x), static_cast<double>(kps[1][idx1].pt.y)});
+        for (size_t i = 2; i < num_cams; ++i) {
+            auto it = cam0_to_cami[i].find(idx0);
+            if (it != cam0_to_cami[i].end()) {
+                int idxi = it->second;
+                tr.push_back({static_cast<int>(i),
+                    static_cast<double>(kps[i][idxi].pt.x), static_cast<double>(kps[i][idxi].pt.y)});
+            }
+        }
+        if (tr.size() >= 2u) tracks.push_back(std::move(tr));
+    }
+
+    const size_t min_tracks = static_cast<size_t>(cfg_.ba_min_tracks_multiview);
+    UNICALIB_INFO("[FullMultiViewBA] 轨迹数 {} (至少 {} 条)", tracks.size(), min_tracks);
+    if (tracks.size() < min_tracks) {
+        UNICALIB_WARN("[FullMultiViewBA] 轨迹不足 ({} < {})，退回两两 BA", tracks.size(), min_tracks);
+        out.extrinsics = calibrate_bundle_adjustment_pairwise_only(
+            frames_per_cam, intrinsics, cam_ids);
+        return out;
+    }
+
+    // 3) 初始化外参：cam0-cam1, cam0-cam2, ...（从轨迹构造匹配并恢复位姿）
+    std::vector<Sophus::SE3d> T_cam0_cami(num_cams);
+    T_cam0_cami[0] = Sophus::SE3d();
+    for (size_t i = 1; i < num_cams; ++i) {
+        std::vector<FeatureMatch> m0i;
+        for (const auto& tr : tracks) {
+            double u0 = 0, v0 = 0, ui = 0, vi = 0;
+            bool has0 = false, has_i = false;
+            for (const auto& o : tr) {
+                if (o.cam_id == 0) { u0 = o.u; v0 = o.v; has0 = true; }
+                if (o.cam_id == static_cast<int>(i)) { ui = o.u; vi = o.v; has_i = true; }
+            }
+            if (has0 && has_i) {
+                FeatureMatch fm;
+                fm.pt0 = cv::Point2f(static_cast<float>(u0), static_cast<float>(v0));
+                fm.pt1 = cv::Point2f(static_cast<float>(ui), static_cast<float>(vi));
+                m0i.push_back(fm);
+            }
+        }
+        Sophus::SO3d rot;
+        Eigen::Vector3d trans;
+        if (m0i.size() >= 8 && recover_pose_from_E(m0i, intrinsics[0], intrinsics[i], rot, trans)) {
+            T_cam0_cami[i] = Sophus::SE3d(rot, trans);
+        } else {
+            T_cam0_cami[i] = Sophus::SE3d();
+            if (i == 1) {
+                UNICALIB_WARN("[FullMultiViewBA] cam0-cam1 位姿恢复失败，退回两两 BA");
+                out.extrinsics = calibrate_bundle_adjustment_pairwise_only(
+                    frames_per_cam, intrinsics, cam_ids);
+                return out;
+            }
+        }
+    }
+
+    // 4) 三角化：用 cam0 和 cam1 得到 3D 点（cam0 系），并保留对应轨迹
+    // 投影矩阵: P0 = K0*[I|0], P1 = K1*[R1^T|-R1^T*t1] (点 X_cam0 在 cam1 中为 R1^T*(X-t1))
+    std::vector<Eigen::Vector3d> points_3d;
+    std::vector<Track> tracks_for_points;
+    cv::Mat K0 = (cv::Mat_<double>(3,3) << intrinsics[0].fx, 0, intrinsics[0].cx,
+                 0, intrinsics[0].fy, intrinsics[0].cy, 0, 0, 1);
+    cv::Mat K1 = (cv::Mat_<double>(3,3) << intrinsics[1].fx, 0, intrinsics[1].cx,
+                 0, intrinsics[1].fy, intrinsics[1].cy, 0, 0, 1);
+    cv::Mat P0 = cv::Mat::eye(3, 4, CV_64F);
+    K0.copyTo(P0(cv::Rect(0,0,3,3)));
+    Sophus::SE3d T_cam1_cam0 = T_cam0_cami[1].inverse();
+    Eigen::Matrix3d R1t = T_cam1_cam0.rotationMatrix();
+    Eigen::Vector3d t1 = T_cam1_cam0.translation();
+    cv::Mat P1 = (cv::Mat_<double>(3,4) <<
+        R1t(0,0), R1t(0,1), R1t(0,2), t1(0),
+        R1t(1,0), R1t(1,1), R1t(1,2), t1(1),
+        R1t(2,0), R1t(2,1), R1t(2,2), t1(2));
+    P1 = K1 * P1;
+    for (const auto& tr : tracks) {
+        cv::Point2f pt0(tr[0].u, tr[0].v);
+        cv::Point2f pt1(tr[1].u, tr[1].v);
+        cv::Mat pts4d;
+        cv::triangulatePoints(P0, P1, std::vector<cv::Point2f>{pt0}, std::vector<cv::Point2f>{pt1}, pts4d);
+        const bool pt4_f64 = (pts4d.type() == CV_64FC1);
+        double w = pt4_f64 ? pts4d.at<double>(3, 0) : static_cast<double>(pts4d.at<float>(3, 0));
+        if (std::abs(w) < 1e-8) continue;
+        double xw = pt4_f64 ? pts4d.at<double>(0,0) : static_cast<double>(pts4d.at<float>(0,0));
+        double yw = pt4_f64 ? pts4d.at<double>(1,0) : static_cast<double>(pts4d.at<float>(1,0));
+        double zw = pt4_f64 ? pts4d.at<double>(2,0) : static_cast<double>(pts4d.at<float>(2,0));
+        Eigen::Vector3d X(xw/w, yw/w, zw/w);
+        if (X.z() < 0.1 || X.z() > 500.0) continue;
+        points_3d.push_back(X);
+        tracks_for_points.push_back(tr);
+    }
+
+    const size_t min_pts = static_cast<size_t>(cfg_.ba_min_points_multiview);
+    if (points_3d.size() < min_pts) {
+        UNICALIB_WARN("[FullMultiViewBA] 三角化有效点过少 ({} < {})，退回两两 BA",
+                      points_3d.size(), min_pts);
+        out.extrinsics = calibrate_bundle_adjustment_pairwise_only(
+            frames_per_cam, intrinsics, cam_ids);
+        return out;
+    }
+
+    // 5) 全局 BA：参数 = [T_cam0_cam1(6), T_cam0_cam2(6), ...], [X1(3), X2(3), ...]
+    ceres::Problem problem;
+    std::vector<double*> extr_params(num_cams);
+    std::vector<double> extr_storage((num_cams - 1) * 6);
+    for (size_t i = 1; i < num_cams; ++i) {
+        extr_params[i] = &extr_storage[(i - 1) * 6];
+        Eigen::Vector3d rv = T_cam0_cami[i].so3().log();
+        Eigen::Vector3d tv = T_cam0_cami[i].translation();
+        extr_storage[(i-1)*6+0] = rv(0); extr_storage[(i-1)*6+1] = rv(1); extr_storage[(i-1)*6+2] = rv(2);
+        extr_storage[(i-1)*6+3] = tv(0); extr_storage[(i-1)*6+4] = tv(1); extr_storage[(i-1)*6+5] = tv(2);
+    }
+    std::vector<double*> point_params(points_3d.size());
+    std::vector<std::vector<double>> point_storage(points_3d.size());
+    for (size_t j = 0; j < points_3d.size(); ++j) {
+        point_storage[j] = {points_3d[j].x(), points_3d[j].y(), points_3d[j].z()};
+        point_params[j] = point_storage[j].data();
+    }
+
+    struct ReprojectCam0Cost {
+        double obs_u, obs_v, fx, fy, cx, cy;
+        template <typename T>
+        bool operator()(const T* const X, T* res) const {
+            T zi = T(1.0) / X[2];
+            res[0] = T(fx) * X[0] * zi + T(cx) - T(obs_u);
+            res[1] = T(fy) * X[1] * zi + T(cy) - T(obs_v);
+            return true;
+        }
+    };
+
+    int obs_count = 0;
+    for (size_t j = 0; j < points_3d.size(); ++j) {
+        const auto& tr = tracks_for_points[j];
+        for (const auto& o : tr) {
+            const CameraIntrinsics& K = intrinsics[o.cam_id];
+            if (o.cam_id == 0) {
+                ceres::CostFunction* cost = new ceres::AutoDiffCostFunction<ReprojectCam0Cost, 2, 3>(
+                    new ReprojectCam0Cost{o.u, o.v, K.fx, K.fy, K.cx, K.cy});
+                problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0), point_params[j]);
+            } else {
+                ceres::CostFunction* cost = MultiViewReprojectCost::Create(
+                    o.u, o.v, K.fx, K.fy, K.cx, K.cy);
+                problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0),
+                                         extr_params[o.cam_id], point_params[j]);
+            }
+            ++obs_count;
+        }
+    }
+
+    ceres::Solver::Options opt;
+    opt.max_num_iterations = cfg_.ba_max_iter * 2;
+    opt.linear_solver_type = ceres::SPARSE_SCHUR;
+    opt.minimizer_progress_to_stdout = cfg_.verbose;
+    ceres::Solver::Summary summary;
+    ceres::Solve(opt, &problem, &summary);
+    UNICALIB_INFO("[FullMultiViewBA] {} (cost={:.4f})",
+                  summary.BriefReport(), summary.final_cost);
+
+    for (size_t i = 1; i < num_cams; ++i) {
+        double* e = extr_params[i];
+        ExtrinsicSE3 ext;
+        ext.ref_sensor_id = cam_ids[0];
+        ext.target_sensor_id = cam_ids[i];
+        ext.SO3_TargetInRef = Sophus::SO3d::exp(Eigen::Vector3d(e[0], e[1], e[2]));
+        ext.POS_TargetInRef = Eigen::Vector3d(e[3], e[4], e[5]);
+        ext.is_converged = (summary.termination_type == ceres::CONVERGENCE);
+        out.extrinsics.push_back(ext);
+    }
+    out.final_cost = summary.final_cost;
+    out.num_points = static_cast<int>(points_3d.size());
+    out.num_observations = obs_count;
+    out.converged = (summary.termination_type == ceres::CONVERGENCE);
+    return out;
 }
 
 // ===================================================================

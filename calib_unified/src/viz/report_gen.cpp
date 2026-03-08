@@ -379,7 +379,11 @@ bool ReportGenerator::generate_yaml(const CalibParamManager& params,
     try {
         params.save_yaml(output_yaml_path);
         return true;
+    } catch (const std::exception& e) {
+        UNICALIB_WARN("生成 YAML 报告失败: {} ({})", output_yaml_path, e.what());
+        return false;
     } catch (...) {
+        UNICALIB_WARN("生成 YAML 报告失败: {} (未知异常)", output_yaml_path);
         return false;
     }
 }
