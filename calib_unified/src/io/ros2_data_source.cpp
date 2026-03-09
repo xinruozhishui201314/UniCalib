@@ -8,14 +8,18 @@
 
 #include "unicalib/io/ros2_data_source.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/io/yaml_io.h"
 #include <rosbag2_cpp/reader.hpp>
 #include <rosbag2_cpp/readers/sequential_reader.hpp>
 #include <rosbag2_storage/storage_options.hpp>
-#include <rosbag2_storage/qos.hpp>
+#include <rosbag2_storage/serialized_bag_message.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/serialization.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/PCLPointCloud2.h>
+#include <opencv2/imgcodecs.hpp>
 #include <chrono>
 #include <thread>
 
@@ -91,7 +95,7 @@ bool Ros2BagDataSource::read_metadata_yaml(const std::string& bag_file) {
 
 void Ros2BagDataSource::auto_detect_topics(
     const std::map<std::string, size_t>& topic_msg_counts) {
-    
+
     // 1) 优先使用配置中的单话题（来自配置文件 sensors[].topic 或 ros2.lidar_topic 等）
     if (!cfg_.lidar_ros2_topic.empty()) {
         topic_mapping_.lidar_topic = cfg_.lidar_ros2_topic;
@@ -138,7 +142,7 @@ void Ros2BagDataSource::auto_detect_topics(
 
 std::string Ros2BagDataSource::find_best_lidar_topic(
     const std::map<std::string, size_t>& topic_msg_counts) {
-    
+
     // LiDAR 话题关键词
     std::vector<std::string> lidar_keywords = {
         "pointcloud", "lidar", "velodyne", "ouster", "livox", "pandar",
@@ -371,70 +375,78 @@ bool Ros2BagDataSource::load() {
         converter_options.input_serialization_format = "cdr";
         converter_options.output_serialization_format = "cdr";
         
-        bag_reader_ = std::make_unique<rosbag2_cpp::SequentialReader>();
+        bag_reader_ = std::make_unique<rosbag2_cpp::readers::SequentialReader>();
         bag_reader_->open(storage_options, converter_options);
-        
+
         UNICALIB_INFO("[Ros2BagDataSource] Bag 已打开，开始读取消息...");
-        
-        // 获取所有话题信息
+
+        // 获取所有话题信息 (TopicMetadata 有 name, type 等字段)
         const auto& topics = bag_reader_->get_all_topics_and_types();
         UNICALIB_INFO("[Ros2BagDataSource] 找到 {} 个话题", topics.size());
-        for (const auto& [topic, type] : topics) {
-            UNICALIB_DEBUG("  话题: {} (类型: {})", topic, type);
+        for (const auto& meta : topics) {
+            UNICALIB_DEBUG("  话题: {} (类型: {})", meta.name, meta.type);
         }
-        
+
+        // 反序列化器 (ROS2 Humble 需手动反序列化 SerializedBagMessage)
+        rclcpp::Serialization<sensor_msgs::msg::PointCloud2> ser_pc;
+        rclcpp::Serialization<sensor_msgs::msg::Image> ser_img;
+        rclcpp::Serialization<sensor_msgs::msg::Imu> ser_imu;
+
         // 读取消息
         bool time_window_set = (cfg_.time_window_end > cfg_.time_window_start);
         double last_time = 0.0;
-        
+
         while (bag_reader_->has_next()) {
             auto msg = bag_reader_->read_next();
-            double msg_time = stamp_to_sec(msg->get_time());
-            
+            // SerializedBagMessage: time_stamp 为纳秒 (rcutils_time_point_value_t)
+            double msg_time = static_cast<double>(msg->time_stamp) * 1e-9;
+
             // 时间窗口过滤
             if (time_window_set) {
                 if (msg_time < cfg_.time_window_start) continue;
                 if (msg_time > cfg_.time_window_end) break;
             }
-            
-                last_time = std::max(last_time, msg_time);
-            
-            // 判断话题类型
-            std::string topic = msg->get_topic_name();
-            
+
+            last_time = std::max(last_time, msg_time);
+
+            std::string topic = msg->topic_name;
+
             // LiDAR 数据
             for (const auto& [sensor_id, lidar_topic] : cfg_.lidar_topics) {
-                if (topic == lidar_topic) {
-                    auto cloud_msg = msg->instantiate<sensor_msgs::msg::PointCloud2>();
-                    if (cloud_msg) {
-                        lidar_data_[sensor_id].push_back(parse_point_cloud2(cloud_msg));
-                        UNICALIB_TRACE("  收集 LiDAR {} 帧数: {}", 
-                                     sensor_id, lidar_data_[sensor_id].size());
-                    }
+                if (topic == lidar_topic && msg->serialized_data) {
+                    rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+                    auto cloud_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
+                    ser_pc.deserialize_message(&serialized_msg, cloud_msg.get());
+                    lidar_data_[sensor_id].push_back(parse_point_cloud2(cloud_msg));
+                    UNICALIB_TRACE("  收集 LiDAR {} 帧数: {}",
+                                 sensor_id, lidar_data_[sensor_id].size());
+                    break;
                 }
             }
-            
+
             // 相机数据
             for (const auto& [sensor_id, camera_topic] : cfg_.camera_topics) {
-                if (topic == camera_topic) {
-                    auto image_msg = msg->instantiate<sensor_msgs::msg::Image>();
-                    if (image_msg) {
-                        camera_data_[sensor_id].push_back(parse_image(image_msg));
-                        UNICALIB_TRACE("  收集相机 {} 帧数: {}", 
-                                     sensor_id, camera_data_[sensor_id].size());
-                    }
+                if (topic == camera_topic && msg->serialized_data) {
+                    rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+                    auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
+                    ser_img.deserialize_message(&serialized_msg, image_msg.get());
+                    camera_data_[sensor_id].push_back(parse_image(image_msg));
+                    UNICALIB_TRACE("  收集相机 {} 帧数: {}",
+                                 sensor_id, camera_data_[sensor_id].size());
+                    break;
                 }
             }
-            
+
             // IMU 数据
             for (const auto& [sensor_id, imu_topic] : cfg_.imu_topics) {
-                if (topic == imu_topic) {
-                    auto imu_msg = msg->instantiate<sensor_msgs::msg::Imu>();
-                    if (imu_msg) {
-                        imu_data_[sensor_id].push_back(parse_imu(imu_msg));
-                        UNICALIB_TRACE("  收集 IMU {} 帧数: {}", 
-                                     sensor_id, imu_data_[sensor_id].size());
-                    }
+                if (topic == imu_topic && msg->serialized_data) {
+                    rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+                    auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
+                    ser_imu.deserialize_message(&serialized_msg, imu_msg.get());
+                    imu_data_[sensor_id].push_back(parse_imu(imu_msg));
+                    UNICALIB_TRACE("  收集 IMU {} 帧数: {}",
+                                 sensor_id, imu_data_[sensor_id].size());
+                    break;
                 }
             }
         }
@@ -593,7 +605,7 @@ bool Ros2RealtimeDataSource::start() {
         }
         
         // 创建执行器
-        executor_ = std::make_unique<rclcpp::exec::SingleThreadedExecutor>();
+        executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
         executor_->add_node(node_);
         
         // 在后台线程中运行
@@ -696,9 +708,9 @@ bool Ros2RealtimeDataSource::wait_for_data(double timeout_sec) {
 
 LiDARScanRos Ros2RealtimeDataSource::convert_point_cloud2(
     const sensor_msgs::msg::PointCloud2::SharedPtr& msg) {
-    
+
     LiDARScanRos scan;
-    scan.timestamp = stamp_to_sec(msg->header.stamp);
+    scan.timestamp = Ros2BagDataSource::stamp_to_sec(msg->header.stamp);
     
     // 转换为 PCL 点云
     pcl::PCLPointCloud2 pcl_pc2;
@@ -760,9 +772,9 @@ void Ros2RealtimeDataSource::lidar_callback(
 void Ros2RealtimeDataSource::camera_callback(
     const std::string& sensor_id,
     const sensor_msgs::msg::Image::SharedPtr msg) {
-    
+
     CameraFrameRos frame;
-    frame.timestamp = stamp_to_sec(msg->header.stamp);
+    frame.timestamp = Ros2BagDataSource::stamp_to_sec(msg->header.stamp);
     
     try {
         cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, "bgr8");
@@ -795,9 +807,9 @@ void Ros2RealtimeDataSource::camera_callback(
 void Ros2RealtimeDataSource::imu_callback(
     const std::string& sensor_id,
     const sensor_msgs::msg::Imu::SharedPtr msg) {
-    
+
     IMUFrameRos frame;
-    frame.timestamp = stamp_to_sec(msg->header.stamp);
+    frame.timestamp = Ros2BagDataSource::stamp_to_sec(msg->header.stamp);
     
     frame.gyro[0] = msg->angular_velocity.x;
     frame.gyro[1] = msg->angular_velocity.y;

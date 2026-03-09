@@ -16,6 +16,9 @@
 
 #include "unicalib/common/sensor_types.h"
 #include "unicalib/common/logger.h"
+#include "unicalib/common/calib_param.h"
+#include "unicalib/extrinsic/imu_lidar_calib.h"
+#include "unicalib/intrinsic/imu_intrinsic_calib.h"
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -32,17 +35,22 @@
 #include <queue>
 #include <atomic>
 
+#if defined(UNICALIB_WITH_ROS2) && UNICALIB_WITH_ROS2
+#include <rclcpp/subscription_base.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
+#endif
+
 // Forward declarations for ROS2 types
 namespace rclcpp {
     class Node;
     class Executor;
-    namespace exec {
-        class SingleThreadedExecutor;
-    }
+    class SubscriptionBase;
 }
 
 namespace rosbag2_cpp {
-    class Reader;
+namespace readers {
+    class SequentialReader;
+}
 }
 
 namespace ns_unicalib {
@@ -192,6 +200,9 @@ public:
     };
     TopicMapping get_topic_mapping() const { return topic_mapping_; }
 
+    // 时间戳转换 (供 Ros2RealtimeDataSource 等复用)
+    static double stamp_to_sec(const builtin_interfaces::msg::Time& stamp);
+
 private:
     // 内部数据存储
     std::map<std::string, std::vector<LiDARScanRos>> lidar_data_;
@@ -207,7 +218,7 @@ private:
     TopicMapping topic_mapping_;
     
     // Bag 读取器
-    std::unique_ptr<rosbag2_cpp::Reader> bag_reader_;
+    std::unique_ptr<rosbag2_cpp::readers::SequentialReader> bag_reader_;
     
     // 解析 PointCloud2 消息
     LiDARScanRos parse_point_cloud2(const std::shared_ptr<sensor_msgs::msg::PointCloud2>& msg);
@@ -217,18 +228,15 @@ private:
     
     // 解析 IMU 消息
     IMUFrameRos parse_imu(const std::shared_ptr<sensor_msgs::msg::Imu>& msg);
-    
-    // 时间戳转换
-    static double stamp_to_sec(const builtin_interfaces::msg::Time& stamp);
-    
+
     // 从 bag metadata.yaml 读取话题映射
     bool read_metadata_yaml(const std::string& bag_file);
     
     // 智能话题匹配
-    bool auto_detect_topics(const std::map<std::string, size_t>& topic_counts);
-    std::string find_best_lidar_topic(const std::vector<std::string>& candidates);
-    std::string find_best_camera_topic(const std::vector<std::string>& candidates);
-    std::string find_best_imu_topic(const std::vector<std::string>& candidates);
+    void auto_detect_topics(const std::map<std::string, size_t>& topic_counts);
+    std::string find_best_lidar_topic(const std::map<std::string, size_t>& topic_msg_counts);
+    std::string find_best_camera_topic(const std::map<std::string, size_t>& topic_msg_counts);
+    std::string find_best_imu_topic(const std::map<std::string, size_t>& topic_msg_counts);
 };
 
 // ===========================================================================
@@ -271,10 +279,10 @@ public:
 private:
     // ROS2 节点
     std::shared_ptr<rclcpp::Node> node_;
-    std::unique_ptr<rclcpp::exec::SingleThreadedExecutor> executor_;
+    std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
     
     // 订阅者 (存储以保持订阅活跃)
-    std::map<std::string, rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
+    std::map<std::string, std::shared_ptr<rclcpp::SubscriptionBase>> subscriptions_;
     
     // 数据缓存 (带锁)
     mutable std::mutex data_mutex_;

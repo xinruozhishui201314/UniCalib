@@ -327,6 +327,6 @@ void reportUnhandledUnknownException();
         ::ns_unicalib::reportUnhandledUnknownException(); \
         return 3; \
     } \
-    return (exitsuccess)
+    return (exitsuccess);
 
 }  // namespace ns_unicalib

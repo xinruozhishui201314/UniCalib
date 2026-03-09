@@ -22,7 +22,7 @@
 # 环境变量:
 #   CALIB_DATA_DIR      数据目录   (默认: $PROJECT/data)
 #   CALIB_RESULTS_DIR   结果目录   (默认: $PROJECT/results)
-#   CALIB_LOGS_DIR      日志目录   (默认: $PROJECT/log)
+#   CALIB_LOGS_DIR      日志目录   (默认: $PROJECT/logs，编译/运行日志带时间戳)
 #   DOCKER_GPU_FLAGS    GPU标志    (默认: --gpus all)
 #   J                   并行编译数 (默认: nproc)
 # =============================================================================
@@ -40,7 +40,7 @@ CONTAINER_BUILD="${CONTAINER_CALIB}/build"
 CONTAINER_BIN="${CONTAINER_BUILD}/bin"
 CONTAINER_DATA="${CONTAINER_WS}/data"
 CONTAINER_RESULTS="${CONTAINER_WS}/results"
-CONTAINER_LOGS="${CONTAINER_WS}/log"
+CONTAINER_LOGS="${CONTAINER_WS}/logs"
 CONTAINER_SCRIPTS="${CONTAINER_WS}/.calib_scripts"   # 临时脚本挂载点
 CONTAINER_AI="${CONTAINER_WS}"
 
@@ -48,7 +48,7 @@ CONTAINER_AI="${CONTAINER_WS}"
 BUILD_DIR="${CALIB_UNIFIED_DIR}/build"
 CALIB_DATA_DIR="${CALIB_DATA_DIR:-${PROJECT_ROOT}/data}"
 CALIB_RESULTS_DIR="${CALIB_RESULTS_DIR:-${PROJECT_ROOT}/results}"
-CALIB_LOGS_DIR="${CALIB_LOGS_DIR:-${PROJECT_ROOT}/log}"
+CALIB_LOGS_DIR="${CALIB_LOGS_DIR:-${PROJECT_ROOT}/logs}"
 SCRIPTS_TMPDIR="${PROJECT_ROOT}/.calib_scripts"  # 临时脚本目录 (挂载入容器)
 
 # Docker
@@ -534,12 +534,12 @@ cmake "${CONTAINER_CALIB}" \
     -DAMENT_PREFIX_PATH=/opt/ros/humble \
     \${CMAKE_EXTRA_TP} \
     ${extra} \
-    2>&1 | tee "${CONTAINER_LOGS}/cmake_configure.log"
+    2>&1 | tee "${CONTAINER_LOGS}/cmake_configure_${BUILD_LOG_TS}.log"
 
 if [[ \${PIPESTATUS[0]} -ne 0 ]]; then
     echo "[ERROR] CMake 配置失败"
     echo "--- 最后错误 ---"
-    grep -E 'error|Error|CMake Error' "${CONTAINER_LOGS}/cmake_configure.log" | tail -20
+    grep -E 'error|Error|CMake Error' "${CONTAINER_LOGS}/cmake_configure_${BUILD_LOG_TS}.log" | tail -20
     exit 1
 fi
 echo "  ✓ CMake 配置成功"
@@ -547,13 +547,13 @@ echo "  ✓ CMake 配置成功"
 # ── 2/4 编译 ────────────────────────────────────────────────────────────────
 echo "[2/4] 编译..."
 cmake --build . -- -j${jobs} \
-    2>&1 | tee "${CONTAINER_LOGS}/build.log"
+    2>&1 | tee "${CONTAINER_LOGS}/build_${BUILD_LOG_TS}.log"
 
 if [[ \${PIPESTATUS[0]} -ne 0 ]]; then
     echo "[ERROR] 编译失败"
     echo "--- 错误摘要 ---"
-    grep -E '^.*error:' "${CONTAINER_LOGS}/build.log" | head -20
-    echo "完整日志: ${CONTAINER_LOGS}/build.log"
+    grep -E '^.*error:' "${CONTAINER_LOGS}/build_${BUILD_LOG_TS}.log" | head -20
+    echo "完整日志: ${CONTAINER_LOGS}/build_${BUILD_LOG_TS}.log"
     exit 1
 fi
 echo "  ✓ 编译成功"
@@ -718,7 +718,7 @@ echo "  结果: PASS=\${PASS}  FAIL=\${FAIL}  SKIP=\${SKIP}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if [[ \$FAIL -gt 0 ]]; then
-    echo "  ⚠ \${FAIL} 项失败，查看构建日志: ${CONTAINER_LOGS}/build.log"
+    echo "  ⚠ \${FAIL} 项失败，查看构建日志: ${CONTAINER_LOGS}/build_${BUILD_LOG_TS}.log"
     exit 1
 else
     echo "  全部通过 (含 \${SKIP} 项跳过) ✓"
@@ -863,9 +863,10 @@ do_check_deps() {
 }
 
 do_build() {
+    BUILD_LOG_TS=$(date +%Y%m%d_%H%M%S)
     log_step "编译 calib_unified"
     log_info "类型: ${BUILD_TYPE}  并行: ${BUILD_JOBS}"
-    log_info "日志: ${CALIB_LOGS_DIR}/build.log"
+    log_info "日志: ${CALIB_LOGS_DIR}/cmake_configure_${BUILD_LOG_TS}.log, build_${BUILD_LOG_TS}.log"
 
     local t0; t0=$(date +%s)
     write_and_run "build.sh" "$(gen_build_script)"
@@ -875,7 +876,7 @@ do_build() {
         log_ok "编译成功 (耗时 $((t1-t0))s)"
     else
         log_error "编译失败"
-        log_error "日志: ${CALIB_LOGS_DIR}/build.log"
+        log_error "日志: ${CALIB_LOGS_DIR}/build_${BUILD_LOG_TS}.log"
         exit $rc
     fi
 }

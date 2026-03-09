@@ -325,6 +325,7 @@ find_package(ament_cmake QUIET)
 find_package(rclcpp QUIET)
 find_package(rosbag2_cpp QUIET)
 find_package(sensor_msgs QUIET)
+find_package(cv_bridge QUIET)
 if(rclcpp_FOUND)
   message(STATUS "ROS2: found rclcpp, enabling full ROS2 integration")
   add_compile_definitions(UNICALIB_WITH_ROS2=1)
@@ -547,6 +548,11 @@ set(UNICALIB_NEW_SOURCES
     src/common/calib_param.cpp  # 确保包含
 )
 
+# ROS2 数据源与 UnifiedDataLoader 实现（仅 UNICALIB_WITH_ROS2 时链接进 unicalib）
+if(UNICALIB_WITH_ROS2)
+    list(APPEND UNICALIB_NEW_SOURCES src/io/ros2_data_source.cpp)
+endif()
+
 # 最小 iKalibr 依赖：供 IMU-LiDAR 外参标定使用 (LiDAROdometer / LiDARFrame / _1_)
 set(IKALIBR_MINIMAL_FOR_IMU_LIDAR
     src/ikalibr/util/utils.cpp
@@ -729,11 +735,24 @@ if(UNICALIB_WITH_ROS_RVIZ AND _VIEWER_BACKEND STREQUAL "RVIZ")
         visualization_msgs::visualization_msgs)
 endif()
 
-# 可选依赖
+# 可选依赖（ROS2 bag 读取与反序列化需 sensor_msgs 类型支持与 cv_bridge）
 if(UNICALIB_WITH_ROS2)
     target_link_libraries(unicalib PUBLIC
         rclcpp::rclcpp
         rosbag2_cpp::rosbag2_cpp)
+    # sensor_msgs typesupport：rclcpp::Serialization 需要 get_message_type_support_handle（在 rosidl_typesupport_cpp 中）
+    target_link_libraries(unicalib PUBLIC
+        "/opt/ros/humble/lib/libsensor_msgs__rosidl_typesupport_cpp.so"
+        "/opt/ros/humble/lib/libsensor_msgs__rosidl_typesupport_fastrtps_cpp.so")
+    # cv_bridge：toCvShare 等
+    if(TARGET cv_bridge)
+        target_link_libraries(unicalib PUBLIC cv_bridge)
+    elseif(cv_bridge_FOUND)
+        find_library(CV_BRIDGE_LIB NAMES cv_bridge PATHS "/opt/ros/humble/lib" "$ENV{AMENT_PREFIX_PATH}/lib" NO_DEFAULT_PATH)
+        if(CV_BRIDGE_LIB)
+            target_link_libraries(unicalib PUBLIC ${CV_BRIDGE_LIB})
+        endif()
+    endif()
 endif()
 
 if(UNICALIB_WITH_OPENMP)

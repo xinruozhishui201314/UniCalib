@@ -468,7 +468,7 @@ ExtrinsicSE3 CamCamCalibrator::bundle_adjustment_two_views(
     if (rv2.norm() < 1e-10)
         result.SO3_TargetInRef = Sophus::SO3d();
     else
-        result.SO3_TargetInRef = Sophus::SO3d(Eigen::AngleAxisd(rv2.norm(), rv2.normalized()));
+        result.SO3_TargetInRef = Sophus::SO3d(Eigen::AngleAxisd(rv2.norm(), rv2.normalized()).toRotationMatrix());
     result.POS_TargetInRef  = Eigen::Vector3d(pose[3], pose[4], pose[5]);
     result.is_converged     = (n_valid >= 10);
     UNICALIB_INFO("[Cam-Cam] 步骤: Bundle Adjustment 完成 (有效点 {} converged={})",
@@ -578,6 +578,20 @@ struct MultiViewReprojectCost {
                                       double fx, double fy, double cx, double cy) {
         return new ceres::AutoDiffCostFunction<MultiViewReprojectCost, 2, 6, 3>(
             new MultiViewReprojectCost(u, v, fx, fy, cx, cy));
+    }
+};
+
+// cam0 系下 3D 点重投影代价（单参数块 3，供 Ceres AutoDiff 使用；须在文件作用域以支持 template 成员）
+struct ReprojectCam0Cost {
+    double obs_u, obs_v, fx, fy, cx, cy;
+    ReprojectCam0Cost(double u, double v, double _fx, double _fy, double _cx, double _cy)
+        : obs_u(u), obs_v(v), fx(_fx), fy(_fy), cx(_cx), cy(_cy) {}
+    template <typename T>
+    bool operator()(const T* const X, T* res) const {
+        T zi = T(1.0) / X[2];
+        res[0] = T(fx) * X[0] * zi + T(cx) - T(obs_u);
+        res[1] = T(fy) * X[1] * zi + T(cy) - T(obs_v);
+        return true;
     }
 };
 }  // namespace
@@ -760,17 +774,6 @@ CamCamCalibrator::MultiViewBAResult CamCamCalibrator::calibrate_bundle_adjustmen
         point_storage[j] = {points_3d[j].x(), points_3d[j].y(), points_3d[j].z()};
         point_params[j] = point_storage[j].data();
     }
-
-    struct ReprojectCam0Cost {
-        double obs_u, obs_v, fx, fy, cx, cy;
-        template <typename T>
-        bool operator()(const T* const X, T* res) const {
-            T zi = T(1.0) / X[2];
-            res[0] = T(fx) * X[0] * zi + T(cx) - T(obs_u);
-            res[1] = T(fy) * X[1] * zi + T(cy) - T(obs_v);
-            return true;
-        }
-    };
 
     int obs_count = 0;
     for (size_t j = 0; j < points_3d.size(); ++j) {

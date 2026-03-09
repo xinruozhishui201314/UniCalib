@@ -245,6 +245,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    int main_exit = 0;
     UNICALIB_MAIN_TRY_BEGIN
 
     // ─── 初始化日志（写入 logs 目录，文件名带时间戳）───────────────────
@@ -441,6 +442,6 @@ int main(int argc, char** argv) {
         UNICALIB_WARN("  或直接调用 ManualCalibSession::run_*() API");
     }
 
-    int exit_code = report.all_converged() ? 0 : 1;
-    UNICALIB_MAIN_TRY_END(exit_code)
+    main_exit = report.all_converged() ? 0 : 1;
+    UNICALIB_MAIN_TRY_END(main_exit)
 }

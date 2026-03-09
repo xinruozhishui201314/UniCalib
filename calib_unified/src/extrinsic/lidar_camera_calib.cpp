@@ -499,7 +499,7 @@ std::optional<ExtrinsicSE3> LiDARCameraCalibrator::calibrate_target(
     Eigen::Vector3d rv(rvec.at<double>(0), rvec.at<double>(1), rvec.at<double>(2));
     Eigen::Vector3d tv(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
     Sophus::SO3d R_cam_lidar =
-        (rv.norm() < 1e-10) ? Sophus::SO3d() : Sophus::SO3d(Eigen::AngleAxisd(rv.norm(), rv.normalized()));
+        (rv.norm() < 1e-10) ? Sophus::SO3d() : Sophus::SO3d(Eigen::AngleAxisd(rv.norm(), rv.normalized()).toRotationMatrix());
 
     ExtrinsicSE3 result;
     result.ref_sensor_id    = lidar_id;

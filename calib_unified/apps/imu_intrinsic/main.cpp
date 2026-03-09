@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
     extra["bias_instab_gyro"] = bg.str();
     extra["noise_accel"] = na.str();
     extra["bias_instab_accel"] = ba.str();
-    append_calib_accuracy(cfg.output_dir, CalibAccuracyTask::IMU_INTRINSIC,
+    ns_unicalib::append_calib_accuracy(cfg.output_dir, ns_unicalib::CalibAccuracyTask::IMU_INTRINSIC,
         true, 0.0, elapsed_ms, extra);
 
     // 打印终端摘要
