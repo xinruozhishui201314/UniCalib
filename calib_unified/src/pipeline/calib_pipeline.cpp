@@ -7,24 +7,30 @@
  *   3. 汇总报告写入 output_dir/pipeline_report_<ts>.yaml
  */
 
-#include "unicalib/pipeline/calib_pipeline.h"
-#include "unicalib/common/logger.h"
-#include "unicalib/common/exception.h"
-#include "unicalib/common/accuracy_logger.h"
-#include "unicalib/extrinsic/lidar_camera_calib.h"
-#include "unicalib/io/yaml_io.h"
-#include "unicalib/io/ros2_data_source.h"
-#include <pcl/io/pcd_io.h>
-#include <opencv2/imgcodecs.hpp>
-#include <spdlog/sinks/basic_file_sink.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/spdlog.h>
+#include <yaml-cpp/yaml.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
 #include <cmath>
+
+// ROS2 头必须在 namespace 外包含，避免 sensor_msgs 等被注入 ns_unicalib 导致编译错误
+#include "unicalib/io/ros2_data_source.h"
+
+#include "unicalib/pipeline/calib_pipeline.h"
+#include "unicalib/common/logger.h"
+#include "unicalib/common/exception.h"
+#include "unicalib/common/accuracy_logger.h"
+#include "unicalib/extrinsic/lidar_camera_calib.h"
+#include "unicalib/extrinsic/cam_cam_calib.h"
+#include "unicalib/intrinsic/imu_intrinsic_calib.h"
+#include "unicalib/io/yaml_io.h"
+#include <pcl/io/pcd_io.h>
+#include <opencv2/imgcodecs.hpp>
+#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 namespace fs = std::filesystem;
 
@@ -502,6 +508,16 @@ StageResult CalibPipeline::run_fine_stage(CalibTaskType task) {
         return run_fine_lidar_camera();
     }
 
+    // ─── IMU 内参精标定 ─────────────────────────────────────────────────
+    if (task == CalibTaskType::IMU_INTRINSIC) {
+        return run_fine_imu_intrinsic();
+    }
+
+    // ─── Camera-Camera 外参精标定（多相机按数目自动两两标定）──────────────
+    if (task == CalibTaskType::CAM_CAM_EXTRIN) {
+        return run_fine_cam_cam();
+    }
+
     // ─── 其他任务（占位）─────────────────────────────────────────────────
     r.success  = true;
     r.message  = "精标定占位 — 请通过具体标定器实现";
@@ -588,7 +604,16 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
     } else if (data_source_type == DataSourceType::ROS2_BAG) {
         if (!fs::exists(cfg_.ros2_bag_file)) {
             r.success = false;
-            r.message = "ROS2 Bag 文件不存在: " + cfg_.ros2_bag_file;
+            r.message = "ROS2 Bag 路径不存在: " + cfg_.ros2_bag_file + "（可为目录，rosbag2 格式）";
+            auto t_end = std::chrono::high_resolution_clock::now();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
+            return r;
+        }
+    } else if (data_source_type == DataSourceType::ROS2_TOPIC) {
+        if (cfg_.lidar_ros2_topic.empty() || cfg_.camera_ros2_topic.empty()) {
+            r.success = false;
+            r.message = "ROS2 实时模式需同时配置 LiDAR 与相机话题（config 中 ros2.lidar_topic / ros2.camera_topic 或 sensors[].topic）";
             auto t_end = std::chrono::high_resolution_clock::now();
             r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
             UNICALIB_ERROR("[Fine-Auto/LiDAR-Cam] {}", r.message);
@@ -710,17 +735,27 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
         ros_cfg.realtime_timeout = cfg_.ros2_max_wait_time;
         ros_cfg.sample_interval = cfg_.ros2_sample_interval;
         ros_cfg.max_frames = cfg_.ros2_max_frames;
+        ros_cfg.strict_topic_match = cfg_.ros2_strict_topic_match;
         
-        // 设置话题映射（单话题与 map 一致，便于数据源使用）
-        if (!cfg_.lidar_ros2_topic.empty()) {
+        // 传感器话题全可配置：优先使用 *_topics 映射，否则回退到单话题
+        if (!cfg_.lidar_topics.empty()) {
+            ros_cfg.lidar_topics = cfg_.lidar_topics;
+            ros_cfg.lidar_ros2_topic = cfg_.lidar_topics.begin()->second;
+        } else if (!cfg_.lidar_ros2_topic.empty()) {
             ros_cfg.lidar_topics[cfg_.lidar_id] = cfg_.lidar_ros2_topic;
             ros_cfg.lidar_ros2_topic = cfg_.lidar_ros2_topic;
         }
-        if (!cfg_.camera_ros2_topic.empty()) {
+        if (!cfg_.camera_topics.empty()) {
+            ros_cfg.camera_topics = cfg_.camera_topics;
+            ros_cfg.camera_ros2_topic = cfg_.camera_topics.begin()->second;
+        } else if (!cfg_.camera_ros2_topic.empty()) {
             ros_cfg.camera_topics[cfg_.camera_id] = cfg_.camera_ros2_topic;
             ros_cfg.camera_ros2_topic = cfg_.camera_ros2_topic;
         }
-        if (!cfg_.imu_ros2_topic.empty()) {
+        if (!cfg_.imu_topics.empty()) {
+            ros_cfg.imu_topics = cfg_.imu_topics;
+            ros_cfg.imu_ros2_topic = cfg_.imu_topics.begin()->second;
+        } else if (!cfg_.imu_ros2_topic.empty()) {
             ros_cfg.imu_topics["imu_0"] = cfg_.imu_ros2_topic;
             ros_cfg.imu_ros2_topic = cfg_.imu_ros2_topic;
         }
@@ -776,18 +811,7 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
     if (!cfg_.camera_intrinsic_file.empty() && fs::exists(cfg_.camera_intrinsic_file)) {
         UNICALIB_INFO("[Fine-Auto/LiDAR-Cam] 加载内参: {}", cfg_.camera_intrinsic_file);
         try {
-            YAML::Node intrin_node = YAML::LoadFile(cfg_.camera_intrinsic_file);
-            cam_intrin.fx     = intrin_node["fx"].as<double>(0.0);
-            cam_intrin.fy     = intrin_node["fy"].as<double>(0.0);
-            cam_intrin.cx     = intrin_node["cx"].as<double>(0.0);
-            cam_intrin.cy     = intrin_node["cy"].as<double>(0.0);
-            cam_intrin.width  = intrin_node["width"].as<int>(0);
-            cam_intrin.height = intrin_node["height"].as<int>(0);
-            if (intrin_node["dist_coeffs"]) {
-                for (const auto& d : intrin_node["dist_coeffs"]) {
-                    cam_intrin.dist_coeffs.push_back(d.as<double>());
-                }
-            }
+            cam_intrin = YamlIO::load_camera_intrinsics(cfg_.camera_intrinsic_file);
             UNICALIB_INFO("  内参: fx={:.1f} fy={:.1f} cx={:.1f} cy={:.1f} {}x{}",
                           cam_intrin.fx, cam_intrin.fy, cam_intrin.cx, cam_intrin.cy,
                           cam_intrin.width, cam_intrin.height);
@@ -903,6 +927,154 @@ StageResult CalibPipeline::run_fine_lidar_camera() {
 }
 
 // ---------------------------------------------------------------------------
+// Camera-Camera 精标定：多相机按数目自动两两标定（环视+前视兼容）
+// ROS2 bag 离线时若未配置 camera_topics，则自动读取 bag 内全部相机并标定
+// ---------------------------------------------------------------------------
+StageResult CalibPipeline::run_fine_cam_cam() {
+    StageResult r;
+    r.stage = CalibStage::FINE_AUTO;
+    r.task  = CalibTaskType::CAM_CAM_EXTRIN;
+    r.quality_threshold = cfg_.cam_cam_rms_threshold;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    if (!cfg_.use_ros2_bag || cfg_.ros2_bag_file.empty()) {
+        r.success = false;
+        r.message = "Camera-Camera 多目标定当前需使用 ROS2 bag（use_ros2_bag: true 且 ros2_bag_file 已配置）";
+        r.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
+        UNICALIB_WARN("[Fine-Auto/Cam-Cam] {}", r.message);
+        return r;
+    }
+
+    // 参与标定的相机 ID：配置了则用配置；否则留空，加载 bag 后从 loader 取「全部相机」
+    std::vector<std::string> camera_ids;
+    if (!cfg_.camera_topics.empty()) {
+        for (const auto& [id, _] : cfg_.camera_topics)
+            camera_ids.push_back(id);
+        std::sort(camera_ids.begin(), camera_ids.end());
+    } else if (!cfg_.camera_id.empty()) {
+        camera_ids.push_back(cfg_.camera_id);
+    }
+
+    std::map<std::string, std::vector<std::pair<double, cv::Mat>>> frames_per_cam;
+    {
+        RosDataSourceConfig ros_cfg;
+        ros_cfg.bag_file = cfg_.ros2_bag_file;
+        ros_cfg.strict_topic_match = cfg_.ros2_strict_topic_match;
+        if (!cfg_.camera_topics.empty())
+            ros_cfg.camera_topics = cfg_.camera_topics;
+        else if (!cfg_.camera_id.empty())
+            ros_cfg.camera_topics[cfg_.camera_id] = cfg_.camera_ros2_topic;
+        // camera_topics 为空时：不设置 ros_cfg.camera_topics，数据源会加载 bag 内全部 Image 话题
+        ros_cfg.max_frames = cfg_.ros2_max_frames;
+        UnifiedDataLoader::Config load_cfg;
+        load_cfg.source_type = UnifiedDataLoader::SourceType::ROS2_BAG;
+        load_cfg.ros_config = ros_cfg;
+        UnifiedDataLoader loader(load_cfg);
+        if (!loader.load()) {
+            r.success = false;
+            r.message = "ROS2 数据加载失败: " + loader.get_status_message();
+            r.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
+            return r;
+        }
+        // 离线 bag 且未配置相机列表时：直接使用 loader 中已加载的全部相机
+        if (camera_ids.empty()) {
+            camera_ids = loader.get_camera_ids();
+            std::sort(camera_ids.begin(), camera_ids.end());
+            UNICALIB_INFO("[Fine-Auto/Cam-Cam] ROS2 bag 离线模式，使用 bag 内全部相机: {} 个", camera_ids.size());
+        }
+        for (const auto& cid : camera_ids) {
+            auto fr = loader.to_camera_frames(cid);
+            if (!fr.empty())
+                frames_per_cam[cid] = std::move(fr);
+        }
+    }
+
+    if (camera_ids.size() < 2u) {
+        r.success = true;
+        r.message = "Camera-Camera 标定需要至少 2 个相机，当前: " + std::to_string(camera_ids.size());
+        r.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
+        UNICALIB_WARN("[Fine-Auto/Cam-Cam] {}", r.message);
+        return r;
+    }
+
+    UNICALIB_INFO("[Fine-Auto/Cam-Cam] 相机数: {}，将依次标定相邻对: (0-1), (1-2), ...", camera_ids.size());
+
+    if (frames_per_cam.size() < 2u) {
+        r.success = false;
+        r.message = "至少需要 2 个相机有有效帧数据，当前: " + std::to_string(frames_per_cam.size());
+        r.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
+        UNICALIB_ERROR("[Fine-Auto/Cam-Cam] {}", r.message);
+        return r;
+    }
+
+    // 按 camera_ids 顺序取有数据的相机，保证相邻对
+    std::vector<std::string> ordered;
+    for (const auto& cid : camera_ids) {
+        if (frames_per_cam.count(cid))
+            ordered.push_back(cid);
+    }
+
+    CamCamCalibrator::Config calib_cfg;
+    calib_cfg.target.cols = cfg_.board_cols;
+    calib_cfg.target.rows = cfg_.board_rows;
+    calib_cfg.target.square_size_m = cfg_.square_size_m;
+    calib_cfg.max_rms_px = cfg_.cam_cam_rms_threshold;
+    calib_cfg.method = cfg_.prefer_targetfree ? CamCamCalibrator::Method::ESSENTIAL_MATRIX : CamCamCalibrator::Method::CHESSBOARD_STEREO;
+
+    auto load_intrin = [this](const std::string& id) -> std::optional<CameraIntrinsics> {
+        if (params_->camera_intrinsics.count(id) && params_->camera_intrinsics.at(id))
+            return *params_->camera_intrinsics.at(id);
+        auto it = cfg_.camera_intrinsic_files.find(id);
+        if (it != cfg_.camera_intrinsic_files.end() && fs::exists(it->second)) {
+            try {
+                return YamlIO::load_camera_intrinsics(it->second);
+            } catch (...) {}
+        }
+        return std::nullopt;
+    };
+
+    int pairs_done = 0;
+    double max_rms = 0.0;
+    for (size_t i = 0; i + 1 < ordered.size(); ++i) {
+        const std::string& id0 = ordered[i];
+        const std::string& id1 = ordered[i + 1];
+        auto in0 = load_intrin(id0);
+        auto in1 = load_intrin(id1);
+        if (!in0.has_value() || !in1.has_value()) {
+            UNICALIB_WARN("[Fine-Auto/Cam-Cam] 跳过 {}->{}: 缺少内参 (请先做相机内参标定或配置 camera_intrinsic_files)", id0, id1);
+            continue;
+        }
+
+        CamCamCalibrator calib(calib_cfg);
+        auto result = calib.calibrate_two_stage(
+            frames_per_cam.at(id0), frames_per_cam.at(id1),
+            *in0, *in1, cfg_.prefer_targetfree, id0, id1);
+
+        if (result.best()) {
+            auto ext = params_->get_or_create_extrinsic(id0, id1);
+            ext->ref_sensor_id = id0;
+            ext->target_sensor_id = id1;
+            ext->set_SE3(result.best()->SE3_TargetInRef());
+            ext->residual_rms = result.best_rms();
+            ext->is_converged = (result.best_rms() <= cfg_.cam_cam_rms_threshold);
+            max_rms = std::max(max_rms, result.best_rms());
+            pairs_done++;
+            UNICALIB_INFO("[Fine-Auto/Cam-Cam] {} -> {} 完成, rms={:.4f} px", id0, id1, result.best_rms());
+        } else {
+            UNICALIB_WARN("[Fine-Auto/Cam-Cam] {} -> {} 未收敛", id0, id1);
+        }
+    }
+
+    r.success = (pairs_done > 0);
+    r.residual_rms = max_rms;
+    r.message = "Camera-Camera 标定完成: " + std::to_string(pairs_done) + " 对, 最大 RMS=" + (r.success ? std::to_string(max_rms) + " px" : "N/A");
+    r.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
+    UNICALIB_INFO("[Fine-Auto/Cam-Cam] {}", r.message);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // 辅助函数: 从图像推断内参
 // ---------------------------------------------------------------------------
 CameraIntrinsics CalibPipeline::infer_intrinsics_from_images(
@@ -941,54 +1113,216 @@ void CalibPipeline::save_extrinsic_result(
     const std::string& path,
     const LiDARCameraCalibrator::TwoStageResult& result) const {
 
-    YAML::Emitter out;
-    out << YAML::BeginMap;
+    ::YAML::Emitter out;
+    out << ::YAML::BeginMap;
 
-    out << YAML::Key << "calibration_type" << YAML::Value << "lidar_camera_extrinsic";
-    out << YAML::Key << "reference_sensor" << YAML::Value << cfg_.lidar_id;
-    out << YAML::Key << "target_sensor" << YAML::Value << cfg_.camera_id;
-    out << YAML::Key << "timestamp" << YAML::Value << now_str();
+    out << ::YAML::Key << "calibration_type" << ::YAML::Value << "lidar_camera_extrinsic";
+    out << ::YAML::Key << "reference_sensor" << ::YAML::Value << cfg_.lidar_id;
+    out << ::YAML::Key << "target_sensor" << ::YAML::Value << cfg_.camera_id;
+    out << ::YAML::Key << "timestamp" << ::YAML::Value << now_str();
 
     if (result.coarse.has_value()) {
-        out << YAML::Key << "coarse_result";
-        out << YAML::BeginMap;
+        out << ::YAML::Key << "coarse_result";
+        out << ::YAML::BeginMap;
         const auto& T = result.coarse->SE3_TargetInRef();
-        out << YAML::Key << "method" << YAML::Value << result.coarse_method;
-        out << YAML::Key << "rms" << YAML::Value << result.coarse_rms;
-        out << YAML::Key << "translation" << YAML::Flow << YAML::BeginSeq
-            << T.translation().x() << T.translation().y() << T.translation().z() << YAML::EndSeq;
+        out << ::YAML::Key << "method" << ::YAML::Value << result.coarse_method;
+        out << ::YAML::Key << "rms" << ::YAML::Value << result.coarse_rms;
+        out << ::YAML::Key << "translation" << ::YAML::Flow << ::YAML::BeginSeq
+            << T.translation().x() << T.translation().y() << T.translation().z() << ::YAML::EndSeq;
         auto rpy = T.so3().log();
-        out << YAML::Key << "rotation_rpy" << YAML::Flow << YAML::BeginSeq
-            << rpy.x() << rpy.y() << rpy.z() << YAML::EndSeq;
-        out << YAML::EndMap;
+        out << ::YAML::Key << "rotation_rpy" << ::YAML::Flow << ::YAML::BeginSeq
+            << rpy.x() << rpy.y() << rpy.z() << ::YAML::EndSeq;
+        out << ::YAML::EndMap;
     }
 
     if (result.fine.has_value()) {
-        out << YAML::Key << "fine_result";
-        out << YAML::BeginMap;
+        out << ::YAML::Key << "fine_result";
+        out << ::YAML::BeginMap;
         const auto& T = result.fine->SE3_TargetInRef();
-        out << YAML::Key << "method" << YAML::Value << result.fine_method;
-        out << YAML::Key << "rms" << YAML::Value << result.fine_rms;
-        out << YAML::Key << "converged" << YAML::Value << result.fine->is_converged;
-        out << YAML::Key << "translation" << YAML::Flow << YAML::BeginSeq
-            << T.translation().x() << T.translation().y() << T.translation().z() << YAML::EndSeq;
+        out << ::YAML::Key << "method" << ::YAML::Value << result.fine_method;
+        out << ::YAML::Key << "rms" << ::YAML::Value << result.fine_rms;
+        out << ::YAML::Key << "converged" << ::YAML::Value << result.fine->is_converged;
+        out << ::YAML::Key << "translation" << ::YAML::Flow << ::YAML::BeginSeq
+            << T.translation().x() << T.translation().y() << T.translation().z() << ::YAML::EndSeq;
         auto rpy = T.so3().log();
-        out << YAML::Key << "rotation_rpy_rad" << YAML::Flow << YAML::BeginSeq
-            << rpy.x() << rpy.y() << rpy.z() << YAML::EndSeq;
-        out << YAML::Key << "rotation_rpy_deg" << YAML::Flow << YAML::BeginSeq
-            << rpy.x() * 180 / M_PI << rpy.y() * 180 / M_PI << rpy.z() * 180 / M_PI << YAML::EndSeq;
-        out << YAML::EndMap;
+        out << ::YAML::Key << "rotation_rpy_rad" << ::YAML::Flow << ::YAML::BeginSeq
+            << rpy.x() << rpy.y() << rpy.z() << ::YAML::EndSeq;
+        out << ::YAML::Key << "rotation_rpy_deg" << ::YAML::Flow << ::YAML::BeginSeq
+            << rpy.x() * 180 / M_PI << rpy.y() * 180 / M_PI << rpy.z() * 180 / M_PI << ::YAML::EndSeq;
+        out << ::YAML::EndMap;
     }
 
-    out << YAML::Key << "needs_manual_refine" << YAML::Value << result.needs_manual;
-    out << YAML::Key << "manual_threshold_px" << YAML::Value << result.manual_threshold_px;
+    out << ::YAML::Key << "needs_manual_refine" << ::YAML::Value << result.needs_manual;
+    out << ::YAML::Key << "manual_threshold_px" << ::YAML::Value << result.manual_threshold_px;
 
-    out << YAML::EndMap;
+    out << ::YAML::EndMap;
 
     std::ofstream f(path);
     if (f.is_open()) {
         f << out.c_str();
         UNICALIB_INFO("[Fine-Auto] 结果已保存: {}", path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IMU 内参精标定实现
+// ---------------------------------------------------------------------------
+StageResult CalibPipeline::run_fine_imu_intrinsic() {
+    StageResult r;
+    r.stage = CalibStage::FINE_AUTO;
+    r.task  = CalibTaskType::IMU_INTRINSIC;
+    r.quality_threshold = cfg_.imu_intrin_rms_threshold;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    UNICALIB_INFO("[Fine-Auto/IMU-Intrin] 开始执行IMU内参标定...");
+
+    // ─── 1. 数据加载 ─────────────────────────────────────────────────
+    ns_unicalib::IMURawData imu_data;
+
+    if (cfg_.use_ros2_bag && !cfg_.ros2_bag_file.empty()) {
+        UNICALIB_INFO("  数据源类型: ROS2 Bag 文件");
+        UNICALIB_INFO("  ROS2 Bag 文件: {}", cfg_.ros2_bag_file);
+
+        if (!fs::exists(cfg_.ros2_bag_file)) {
+            r.success = false;
+            r.message = "ROS2 Bag 路径不存在: " + cfg_.ros2_bag_file;
+            return r;
+        }
+
+        RosDataSourceConfig ros_cfg;
+        ros_cfg.bag_file = cfg_.ros2_bag_file;
+        ros_cfg.realtime_mode = false;
+        ros_cfg.max_frames = 0;  // 不限制，IMU 内参需要尽量多静置数据
+        ros_cfg.strict_topic_match = cfg_.ros2_strict_topic_match;
+        if (!cfg_.imu_topics.empty()) {
+            ros_cfg.imu_topics = cfg_.imu_topics;
+            ros_cfg.imu_ros2_topic = cfg_.imu_topics.count(cfg_.imu_sensor_id) ?
+                cfg_.imu_topics.at(cfg_.imu_sensor_id) : cfg_.imu_topics.begin()->second;
+        } else if (!cfg_.imu_ros2_topic.empty()) {
+            ros_cfg.imu_topics[cfg_.imu_sensor_id] = cfg_.imu_ros2_topic;
+            ros_cfg.imu_ros2_topic = cfg_.imu_ros2_topic;
+        }
+
+        UnifiedDataLoader::Config unified_cfg;
+        unified_cfg.source_type = UnifiedDataLoader::SourceType::ROS2_BAG;
+        unified_cfg.ros_config = ros_cfg;
+        unified_cfg.max_frames = 0;
+
+        UnifiedDataLoader loader(unified_cfg);
+        if (!loader.load()) {
+            r.success = false;
+            r.message = "ROS2 数据加载失败: " + loader.get_status_message();
+            return r;
+        }
+
+        imu_data = loader.to_imu_raw_data(cfg_.imu_sensor_id);
+        UNICALIB_INFO("  加载IMU数据: {} 帧 (sensor_id={})", imu_data.size(), cfg_.imu_sensor_id);
+
+    } else if (!cfg_.imu_data_file.empty()) {
+        UNICALIB_INFO("  数据源类型: CSV文件");
+        UNICALIB_INFO("  IMU数据文件: {}", cfg_.imu_data_file);
+        
+        // TODO: 实现CSV加载功能
+        UNICALIB_ERROR("CSV数据加载功能暂未实现");
+        r.success = false;
+        r.message = "CSV数据加载未实现";
+        return r;
+    } else {
+        UNICALIB_ERROR("未指定数据源 (ros2_bag_file 或 imu_data_file)");
+        r.success = false;
+        r.message = "数据源未配置";
+        return r;
+    }
+
+    if (imu_data.empty()) {
+        UNICALIB_ERROR("IMU数据为空，请检查ROS2 bag文件是否包含IMU数据");
+        r.success = false;
+        r.message = "IMU数据加载失败或bag文件中无IMU数据";
+        return r;
+    }
+
+    // ─── 2. Allan方差分析 ─────────────────────────────────────────────
+    UNICALIB_LOG_STEP("IMU-Intrin", "Step 1: Allan 方差分析...");
+    
+    ns_unicalib::IMUIntrinsicCalibrator calibrator(cfg_.imu_intrinsic_calib_cfg);
+    
+    if (progress_cb_) {
+        calibrator.set_progress_callback([&](const std::string& stage, double progress) {
+            progress_cb_(CalibStage::FINE_AUTO, "Allan方差分析: " + stage, 0.1 + 0.6 * progress);
+        });
+    }
+    
+    auto intrinsics = calibrator.calibrate(imu_data);
+
+    // ─── 3. 保存结果 ─────────────────────────────────────────────────
+    UNICALIB_LOG_STEP("IMU-Intrin", "Step 2: 保存标定结果...");
+
+    std::string output_yaml = cfg_.output_dir + "/imu_intrinsic.yaml";
+    save_imu_intrinsic_yaml(intrinsics, output_yaml);
+
+    // 保存 Allan 偏差图（analyze_allan 与 calibrate 内部逻辑一致，仅用于绘图）
+    ns_unicalib::AllanResult allan_result = calibrator.analyze_allan(imu_data);
+    if (!allan_result.gyro[0].taus.empty()) {
+        std::string plot_path = cfg_.output_dir + "/imu_allan_variance.png";
+        calibrator.save_allan_plot(allan_result, plot_path);
+    }
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    r.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    r.success = true;
+    r.residual_rms = intrinsics.allan_fit_rms;
+    std::ostringstream msg_oss;
+    msg_oss << "IMU内参标定完成: gyro_noise=" << intrinsics.noise_gyro
+            << " rad/s/√Hz, gyro_bias=" << intrinsics.bias_instab_gyro
+            << " rad/s, accel_noise=" << intrinsics.noise_acce
+            << " m/s²/√Hz, accel_bias=" << intrinsics.bias_instab_acce << " m/s²";
+    r.message = msg_oss.str();
+    
+    UNICALIB_INFO("[Fine-Auto/IMU-Intrin] 标定完成: RMS={:.4f} | 耗时: {:.1f} ms", 
+                  r.residual_rms, r.elapsed_ms);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// 保存 IMU 内参结果到 YAML
+// ---------------------------------------------------------------------------
+void CalibPipeline::save_imu_intrinsic_yaml(const ns_unicalib::IMUIntrinsics& intrinsics,
+                                           const std::string& path) const {
+    ::YAML::Emitter out;
+    out << ::YAML::BeginMap;
+    out << ::YAML::Key << "imu_id" << ::YAML::Value << cfg_.imu_sensor_id;
+
+    // 陀螺仪参数 (noise_density: rad/s/√Hz, bias_instability: rad/s)
+    out << ::YAML::Key << "gyroscope" << ::YAML::BeginMap;
+    out << ::YAML::Key << "noise_density" << ::YAML::Value << intrinsics.noise_gyro;
+    out << ::YAML::Key << "bias_instability" << ::YAML::Value << intrinsics.bias_instab_gyro;
+    out << ::YAML::Key << "random_walk" << ::YAML::Value << 0.0;
+    out << ::YAML::EndMap;
+
+    // 加速度计参数 (noise_density: m/s²/√Hz, bias_instability: m/s²)
+    out << ::YAML::Key << "accelerometer" << ::YAML::BeginMap;
+    out << ::YAML::Key << "noise_density" << ::YAML::Value << intrinsics.noise_acce;
+    out << ::YAML::Key << "bias_instability" << ::YAML::Value << intrinsics.bias_instab_acce;
+    out << ::YAML::Key << "random_walk" << ::YAML::Value << 0.0;
+    out << ::YAML::EndMap;
+
+    // 元数据
+    out << ::YAML::Key << "metadata" << ::YAML::BeginMap;
+    out << ::YAML::Key << "method" << ::YAML::Value << "allan_variance";
+    out << ::YAML::Key << "num_samples" << ::YAML::Value << intrinsics.num_samples_used;
+    out << ::YAML::Key << "allan_fit_rms" << ::YAML::Value << intrinsics.allan_fit_rms;
+    out << ::YAML::EndMap;
+
+    out << ::YAML::EndMap;
+
+    std::ofstream f(path);
+    if (f.is_open()) {
+        f << out.c_str();
+        UNICALIB_INFO("[Fine-Auto] IMU内参已保存: {}", path);
+    } else {
+        UNICALIB_ERROR("[Fine-Auto] 无法保存IMU内参到: {}", path);
     }
 }
 

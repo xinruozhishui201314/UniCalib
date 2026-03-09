@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
     // --- 参数解析（先解析 output_dir 以便日志落盘）---
     std::string images_dir;
     std::string model_str = "pinhole";
-    std::string output_dir = "./calib_output/camera_intrinsic";
+    std::string output_dir = "./results";
     std::string sensor_id = "cam_0";
     CameraIntrinsicCalibrator::Config cfg;
     cfg.target.type = TargetConfig::Type::CHESSBOARD;

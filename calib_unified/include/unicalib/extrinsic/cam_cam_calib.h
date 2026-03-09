@@ -162,6 +162,15 @@ public:
         const std::string& cam0_id = "cam_0",
         const std::string& cam1_id = "cam_1");
 
+    // 方法 A 重载: 从内存帧 (用于两阶段标定精化)
+    std::optional<ExtrinsicSE3> calibrate_stereo(
+        const std::vector<std::pair<double, cv::Mat>>& frames_cam0,
+        const std::vector<std::pair<double, cv::Mat>>& frames_cam1,
+        const CameraIntrinsics& intrin0,
+        const CameraIntrinsics& intrin1,
+        const std::string& cam0_id = "cam_0",
+        const std::string& cam1_id = "cam_1");
+
     // 方法 B: 本质矩阵
     std::optional<ExtrinsicSE3> calibrate_essential(
         const std::vector<std::pair<double, cv::Mat>>& frames_cam0,

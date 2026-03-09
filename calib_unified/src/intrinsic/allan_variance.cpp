@@ -95,8 +95,8 @@ void compute_oadev(
         double avar = sum / (2.0 * tau * tau * count);
         double adev = std::sqrt(std::max(0.0, avar));
 
-        // 不确定度估计 (chi-squared 近似)
-        double dof  = (N - 2*m) / m;
+        // 不确定度估计 (chi-squared 近似)，使用浮点除法避免整数除零
+        double dof  = static_cast<double>(static_cast<int64_t>(N) - 2 * m) / static_cast<double>(m);
         if (dof <= 0.0) {
             UNICALIB_WARN("[Allan] 自由度非正: dof={}", dof);
             continue;
@@ -303,9 +303,10 @@ std::vector<StaticSegment> IMUIntrinsicCalibrator::detect_static_segments(
         }
         gyro_var /= win_size;
 
-        // 判断是否静止
+        // 判断是否静止：陀螺均值与陀螺标准差均用 rad/s 阈值（避免与加速度 m/s² 混用）
+        double gyro_std = std::sqrt(gyro_var);
         bool is_static = (gyro_mean.norm() < cfg_.static_gyro_threshold &&
-                          std::sqrt(gyro_var) < cfg_.static_accel_var_threshold);
+                          gyro_std < cfg_.static_gyro_threshold);
 
         if (is_static && !in_static) {
             in_static = true;
@@ -367,15 +368,15 @@ std::optional<SixPositionResult> IMUIntrinsicCalibrator::calibrate_six_position(
     // 使用最小二乘法: ||Ma * a_true + b_a|| = g
     // 简化: 假设比例因子接近对角, 估计零偏
     Eigen::Vector3d bias = Eigen::Vector3d::Zero();
-    // 使用六个互相对立的位置 (符号相反的对) 来消除比例
-    // 简化实现: 取所有平均值的一半偏差作为偏置估计
-    int used = std::min(static_cast<int>(acc_meas.size()), 12);
-    for (int i = 0; i < used; ++i) {
-        // 投影到重力方向, 差值作为零偏
-        Eigen::Vector3d dir = acc_meas[i].normalized();
+    int used = 0;
+    for (size_t i = 0; i < acc_meas.size() && used < 12; ++i) {
+        double n = acc_meas[i].norm();
+        if (n < 1e-9) continue;  // 避免 normalized() 零向量/数值不稳定
+        Eigen::Vector3d dir = acc_meas[i] / n;
         bias += acc_meas[i] - dir * g_mag;
+        ++used;
     }
-    bias /= used;
+    if (used > 0) bias /= used;
 
     SixPositionResult result;
     result.bias_accel = bias;
@@ -443,7 +444,7 @@ IMUIntrinsics IMUIntrinsicCalibrator::calibrate(const IMURawData& data) {
     UNICALIB_INFO("  陀螺噪声:     {:.4e} rad/s/√Hz", result.noise_gyro);
     UNICALIB_INFO("  陀螺零偏不稳: {:.4e} rad/s", result.bias_instab_gyro);
     UNICALIB_INFO("  加速度计噪声: {:.4e} m/s²/√Hz", result.noise_acce);
-    UNICALIB_INFO("  加速度计零偏: {:.4e} m/s²", result.bias_instab_acce);
+    UNICALIB_INFO("  加速度计零偏不稳: {:.4e} m/s²", result.bias_instab_acce);
 
     return result;
 }

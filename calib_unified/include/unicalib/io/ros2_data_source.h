@@ -119,6 +119,9 @@ struct RosDataSourceConfig {
     // 最大帧数 (0 = 无限制)
     size_t max_frames = 0;
     
+    // 以配置文件为准：为 true 时，配置的话题在 bag 中无数据则加载失败，不自动回退到其他话题
+    bool strict_topic_match = true;
+    
     // 实时模式 (订阅话题而非播放bag)
     bool realtime_mode = false;
     
@@ -216,6 +219,16 @@ private:
     
     // 话题映射（从 metadata.yaml 自动推断或手动配置）
     TopicMapping topic_mapping_;
+    
+    // 从 metadata.yaml 解析的话题信息（用于诊断日志与 fallback）
+    std::map<std::string, size_t> bag_topic_msg_counts_;
+    std::map<std::string, std::string> bag_topic_types_;
+    
+    // sensor_id / 话题名 -> 实际话题名（用于“选择使用”：配置或默认选中的话题）
+    // get_*_frames(sensor_id) 先查此映射，再查 *_data_ 中 key 为话题名的数据
+    std::map<std::string, std::string> effective_lidar_topic_;
+    std::map<std::string, std::string> effective_camera_topic_;
+    std::map<std::string, std::string> effective_imu_topic_;
     
     // Bag 读取器
     std::unique_ptr<rosbag2_cpp::readers::SequentialReader> bag_reader_;
@@ -368,6 +381,9 @@ public:
     
     // 获取内参 (若可用)
     std::optional<CameraIntrinsics> get_camera_intrinsics(const std::string& sensor_id = "cam_left") const;
+    
+    /** 获取已加载的相机 ID 列表（ROS2 bag 下为话题名 + 映射 id，文件模式为 data key） */
+    std::vector<std::string> get_camera_ids() const;
     
     // 状态
     bool is_ready() const;

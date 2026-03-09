@@ -6,7 +6,7 @@
 
 | 标定类型 | 算法来源 | 方法 |
 |---|---|---|
-| IMU 内参 | unicalib_C_plus_plus + iKalibr | Allan 方差 + 六面法 |
+| IMU 内参 | unicalib_C_plus_plus + iKalibr | Allan 方差 + 六面法；静态段不足时可选 Transformer-IMU-Calibrator 备选 |
 | 相机内参 (针孔/鱼眼) | unicalib_C_plus_plus | OpenCV calib3d/fisheye |
 | IMU-LiDAR 外参 | iKalibr (B样条) | 手眼旋转 + B样条精化 |
 | LiDAR-Camera 外参 | iKalibr + MIAS-LCEC | 棋盘格 / 边缘对齐 |
@@ -139,6 +139,13 @@ make -j$(nproc)
 ## 配置文件
 
 全工程**唯一配置文件**：`config/unicalib_example.yaml`。所有标定任务（imu-intrin / cam-intrin / imu-lidar / lidar-cam / cam-cam / joint）均使用该文件；内含传感器定义、数据路径、各任务参数及详细注释。数据路径可使用 `--data-dir`、`--dataset`（如 `nya_02_ros2`）与脚本配合使用，见上文「一键脚本」示例。
+
+### IMU 内参：六面法静态段不足时的备选 (Transformer-IMU-Calibrator)
+
+当采集数据中**静态段数量 &lt; 6**（不满足六面法多姿态静止要求）时，可启用 **Transformer-IMU-Calibrator** 作为备选，基于动态数据估计陀螺/加速度计零偏（参考 [Transformer IMU Calibrator](https://arxiv.org/abs/2506.10580)）。在配置中取消注释并填写 `third_party.transformer_imu` 路径，并保证 `imu_intrinsic.use_transformer_fallback_when_insufficient_static: true`（默认开启）。也可通过环境变量 `UNICALIB_TRANSFORMER_IMU=/path/to/Transformer-IMU-Calibrator` 指定路径。启用后，若检测到静态段不足，将自动调用该工具并合并零偏到标定结果；噪声与零偏不稳定性仍来自 Allan 方差。
+
+- **模型路径**：默认加载 `model/TIC_13.pth`（与仓库一致）；可通过 `third_party.transformer_imu_model_weights` 覆盖。
+- **入口脚本**：C++ 调用 `eval_unicalib.py`（`--imu_data` / `--weights` / `--output_dir`），该脚本会加载 TIC 模型并写出 `imu_intrinsics.json`，确保模型在标定中被加载并使用。
 
 ## IMU 数据格式 (CSV)
 

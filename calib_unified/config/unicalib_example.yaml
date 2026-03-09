@@ -20,12 +20,14 @@
 
 # ---------------------------------------------------------------------------
 # 任务开关 (仅 unicalib_joint 联合标定时生效；单任务由命令行 --task 决定)
+# auto_tasks: true 时，以下 do_* 由 sensors 数量自动推导，无需手填。
 # ---------------------------------------------------------------------------
+auto_tasks:                 false  # 为 true 时：根据 sensors 中 IMU/LiDAR/相机数量自动勾选任务，实现全自动标定
 do_imu_intrinsic:           true   # 是否执行 IMU 内参标定 (Allan + 六面法)
 do_camera_intrinsic:        true   # 是否执行相机内参标定 (棋盘格)
 do_imu_lidar_extrinsic:     true   # 是否执行 IMU-LiDAR 外参标定
 do_lidar_camera_extrinsic:  true   # 是否执行 LiDAR-Camera 外参标定
-do_cam_cam_extrinsic:       false  # 是否执行 Camera-Camera 外参标定 (单目可关)
+do_cam_cam_extrinsic:       false  # 是否执行 Camera-Camera 外参标定（多目时设为 true 或配合 auto_tasks）
 do_joint_bspline_refine:    true   # 是否进行 iKalibr B 样条联合精化
 
 verbose: true
@@ -34,17 +36,18 @@ verbose: true
 # 输出目录
 # 所有任务的结果均可写入此目录（或各 app 在其下建子目录）
 # ---------------------------------------------------------------------------
-output_dir: ./calib_output/joint
+output_dir: ./results
 
 # ---------------------------------------------------------------------------
-# 传感器系统配置
-# 定义参与标定的传感器 id、类型、ROS topic 及各自参数；IMU/LiDAR/Camera 话题默认由此读取，ros2 段可覆盖
+# 传感器系统配置（话题与数量均在此配置，全自动化标定只需改此处 + auto_tasks: true）
+# 每个传感器：id（唯一）、type（imu/lidar/camera）、topic（ROS2 话题），以及可选 type 专属参数。
+# 数据源会按此处加载所有配置的话题；任务由 do_* 或 auto_tasks 决定。
 # ---------------------------------------------------------------------------
 sensors:
-  # IMU：用于内参标定及作为外参参考系 (reference_imu)
+  # IMU：用于内参标定及作为外参参考系 (reference_imu)。话题必须与 bag 中实际话题一致。
   - id: imu_0
     type: imu
-    topic: /imu/data             # 默认 ROS/ROS2 话题（bag 与实时订阅均用）
+    topic: /dji_sdk/imu          # 与示例 bag (nya_02_ros2) 一致；若用其他 bag 请改为该 bag 内 IMU 话题
     imu:
       rate_hz: 200.0
       model: scale_misalignment  # bias_only | scale_only | scale_misalignment
@@ -52,7 +55,7 @@ sensors:
   # LiDAR：用于 IMU-LiDAR、LiDAR-Camera 外参
   - id: lidar_front
     type: lidar
-    topic: /velodyne_points
+    topic: /os1_cloud_node1/points  # 与示例 bag (nya_02_ros2) 一致
     lidar:
       type: spinning             # spinning | solid_state
       scan_lines: 32
@@ -61,7 +64,7 @@ sensors:
   # 相机：用于内参、LiDAR-Camera、Camera-Camera 外参
   - id: cam_left
     type: camera
-    topic: /cam_left/image_raw
+    topic: /left/image_raw       # 与示例 bag (nya_02_ros2) 一致
     camera:
       model: pinhole             # pinhole | fisheye
       width: 1280
@@ -69,10 +72,13 @@ sensors:
       fps: 30.0
       rolling_shutter: false
 
-  # 多目时取消注释，用于 Camera-Camera 外参
+  # 多目时取消注释，用于 Camera-Camera 外参（根据相机数目自动两两标定：相邻对 0-1,1-2,...）
   # - id: cam_right
   #   type: camera
   #   topic: /cam_right/image_raw
+  #   camera: { model: pinhole, width: 1280, height: 720 }
+  #
+  # 环视+前视多目示例：可配置多组 - id + topic，cam-cam 会按数目自动两两标定（如 cam_front,cam_fl,cam_fr,cam_bl,cam_br 共 5 目 → 4 对）
 
 # 外参参考系：所有外参均相对此 IMU 坐标系
 reference_imu: imu_0
@@ -84,10 +90,11 @@ reference_imu: imu_0
 # 示例：--dataset nya_02_ros2 时，可将 imu_0 设为 imu.csv（即 CALIB_DATA_DIR/imu.csv）
 # ---------------------------------------------------------------------------
 data:
-  # ROS2 bag：若用 bag 驱动，填 bag 路径（相对 CALIB_DATA_DIR 或绝对路径）
+  # ROS2 bag：若用 bag 驱动，填 bag 路径（相对 CALIB_DATA_DIR 或绝对路径）；也可在 ros2.ros2_bag_file 中配置
   bag_file: /path/to/calibration_data.bag
 
-  # IMU 数据：每个 sensor id 对应一个 CSV 或目录
+  # IMU 数据：每个 sensor id 对应一个 CSV 文件路径（仅 CSV 模式使用）
+  # 当 ros2.use_ros2_bag 为 true 时，IMU 从 bag 中按 ros2.imu_topic/sensors[].topic 读取，此处可保留占位或省略
   # CSV 格式: timestamp[s], gx[rad/s], gy[rad/s], gz[rad/s], ax[m/s²], ay[m/s²], az[m/s²]
   imu:
     imu_0: /path/to/imu_data/imu.csv
@@ -105,26 +112,40 @@ data:
       # intrinsic_yaml: /path/to/cam_left_intrinsic.yaml  # 有内参时可跳过内参标定
 
 # ---------------------------------------------------------------------------
-# ROS2 数据源配置
+# ROS2 数据源配置 — 支持在线标定（实时话题）与离线标定（bag 回放）
 # 话题默认从上方 sensors[].topic 按类型读取；此处可覆盖。
+# 使用 --dataset <名>（如 nya_02_ros2）时，数据目录为 CALIB_DATA_DIR/<名>，
+# ros2_bag_file 若为相对路径则相对该数据目录解析。
 # ---------------------------------------------------------------------------
 ros2:
-  # 启用 ROS2 bag 文件读取 (优先于文件模式)
-  use_ros2_bag: false
-  ros2_bag_file: /path/to/data.bag  # ROS2 bag 文件路径 (绝对路径或相对 CALIB_DATA_DIR)
+  # 离线标定：从 ROS2 bag 文件/目录读取（rosbag2 格式为目录，内含 metadata.yaml）
+  use_ros2_bag: true
+  ros2_bag_file: nya_02_slam_imu_to_lidar/nya_02_ros2   # 绝对路径或相对 CALIB_DATA_DIR（--data-dir 指向的目录）；勿在相对路径前再加 data/，CALIB_DATA_DIR 已是数据根
   
-  # 启用 ROS2 实时话题订阅 (用于在线标定)
+  # 在线标定：订阅当前 ROS2 网络中的实时话题
   use_ros2_topics: false
   
-  # ROS2 话题名称（可选；不填则使用 sensors 中同类型第一个 sensor 的 topic）
-  lidar_topic: /velodyne_points      # LiDAR 点云话题
-  camera_topic: /cam_left/image_raw  # 相机图像话题
-  imu_topic: /imu/data               # IMU 数据话题
+  # ROS2 话题名称（须与 bag 内话题一致；不填则使用 sensors 中同类型第一个 sensor 的 topic）
+  lidar_topic: /os1_cloud_node1/points   # 与示例 bag nya_02_ros2 一致
+  camera_topic: /left/image_raw         # 与示例 bag nya_02_ros2 一致
+  imu_topic: /dji_sdk/imu               # 与示例 bag nya_02_ros2 一致
+  
+  # 以配置文件为准：为 true 时，配置话题在 bag 中无数据则加载失败，不自动回退；为 false 时允许自动选用 bag 内其他同类型话题
+  strict_topic_match: true
   
   # ROS2 数据采集参数
   max_wait_time: 30.0       # 实时模式最大等待时间 (秒)
   sample_interval: 0.0      # 数据采样间隔 (秒, 0=不跳过)
-  max_frames: 100          # 最大帧数限制 (0=无限制)
+  max_frames: 100            # 最大帧数限制 (0=无限制)
+
+# ---------------------------------------------------------------------------
+# 第三方 / AI 标定工具路径（可选）
+# 用于六面法静态段不足时 IMU 内参备选、相机内参粗估、IMU-LiDAR 粗外参等
+# 也可通过环境变量设置: UNICALIB_TRANSFORMER_IMU, UNICALIB_DM_CALIB 等
+# ---------------------------------------------------------------------------
+# third_party:
+#   transformer_imu: /path/to/Transformer-IMU-Calibrator   # IMU 内参备选（无需 6 姿态静止）
+#   transformer_imu_model_weights: model/TIC_13.pth         # 可选，默认即 model/TIC_13.pth，确保加载
 
 # ---------------------------------------------------------------------------
 # IMU 内参标定参数
@@ -135,6 +156,10 @@ imu_intrinsic:
   static_detect_window: 0.5   # 静态检测滑动窗口时长 (s)
   min_static_frames: 50       # 最少连续静态帧数
   allan_num_tau_points: 50   # Allan 方差曲线 τ 点数
+  # 当静态段 <6 时，若已配置 third_party.transformer_imu 则用脚本估计零偏
+  use_transformer_fallback_when_insufficient_static: true
+  # 单 IMU 时建议 true：传 --mean-only，避免 6× 复制输入降低 TIC 标定精度
+  transformer_imu_mean_only: false
 
 # ---------------------------------------------------------------------------
 # 相机内参标定参数

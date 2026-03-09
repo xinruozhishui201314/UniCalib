@@ -243,6 +243,164 @@ std::optional<ExtrinsicSE3> CamCamCalibrator::calibrate_stereo(
     return result;
 }
 
+// 方法 A 重载: 从内存帧
+std::optional<ExtrinsicSE3> CamCamCalibrator::calibrate_stereo(
+    const std::vector<std::pair<double, cv::Mat>>& frames_cam0,
+    const std::vector<std::pair<double, cv::Mat>>& frames_cam1,
+    const CameraIntrinsics& intrin0,
+    const CameraIntrinsics& intrin1,
+    const std::string& cam0_id,
+    const std::string& cam1_id) {
+
+    UNICALIB_INFO("=== Camera-Camera 棋盘格立体标定 (内存帧) ===");
+    UNICALIB_INFO("  {} ↔ {}", cam0_id, cam1_id);
+
+    size_t N = std::min(frames_cam0.size(), frames_cam1.size());
+    if (N == 0) {
+        UNICALIB_ERROR("帧数为 0");
+        return std::nullopt;
+    }
+
+    CameraIntrinsicCalibrator::Config det_cfg;
+    det_cfg.target = cfg_.target;
+    CameraIntrinsicCalibrator detector(det_cfg);
+
+    std::vector<std::vector<cv::Point3f>> obj_all;
+    std::vector<std::vector<cv::Point2f>> img0_all, img1_all;
+    auto obj = cfg_.target.object_points();
+
+    int W = 0, H = 0;
+    for (size_t i = 0; i < N; ++i) {
+        const cv::Mat& im0 = frames_cam0[i].second;
+        const cv::Mat& im1 = frames_cam1[i].second;
+        if (im0.empty() || im1.empty()) continue;
+        if (W == 0) { W = im0.cols; H = im0.rows; }
+
+        auto f0 = detector.detect_corners(im0);
+        auto f1 = detector.detect_corners(im1);
+        if (f0.detection_ok && f1.detection_ok) {
+            obj_all.push_back(obj);
+            img0_all.push_back(f0.corners);
+            img1_all.push_back(f1.corners);
+        }
+    }
+
+    if (obj_all.size() < 5) {
+        UNICALIB_ERROR("有效帧对不足 (需≥5, 实有{})", obj_all.size());
+        return std::nullopt;
+    }
+
+    cv::Mat K0 = (cv::Mat_<double>(3,3) <<
+        intrin0.fx, 0, intrin0.cx, 0, intrin0.fy, intrin0.cy, 0, 0, 1);
+    cv::Mat K1 = (cv::Mat_<double>(3,3) <<
+        intrin1.fx, 0, intrin1.cx, 0, intrin1.fy, intrin1.cy, 0, 0, 1);
+    cv::Mat D0 = cv::Mat(intrin0.dist_coeffs).reshape(1, 1);
+    cv::Mat D1 = cv::Mat(intrin1.dist_coeffs).reshape(1, 1);
+
+    cv::Mat R, T, E, F;
+    double rms = cv::stereoCalibrate(
+        obj_all, img0_all, img1_all, K0, D0, K1, D1,
+        cv::Size(W, H), R, T, E, F,
+        cv::CALIB_FIX_INTRINSIC,
+        cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 100, 1e-7));
+
+    UNICALIB_INFO("  RMS={:.4f}px 有效帧={}", rms, obj_all.size());
+
+    Eigen::Matrix3d R_eig;
+    Eigen::Vector3d t_eig;
+    cv::cv2eigen(R, R_eig);
+    cv::cv2eigen(T, t_eig);
+
+    ExtrinsicSE3 result;
+    result.ref_sensor_id    = cam0_id;
+    result.target_sensor_id = cam1_id;
+    result.SO3_TargetInRef  = Sophus::SO3d(R_eig);
+    result.POS_TargetInRef  = t_eig;
+    result.residual_rms     = rms;
+    result.is_converged     = (rms < cfg_.max_rms_px);
+    return result;
+}
+
+// ===================================================================
+// 两阶段标定 (推荐使用)
+// ===================================================================
+CamCamCalibrator::TwoStageResult CamCamCalibrator::calibrate_two_stage(
+    const std::vector<std::pair<double, cv::Mat>>& frames_cam0,
+    const std::vector<std::pair<double, cv::Mat>>& frames_cam1,
+    const CameraIntrinsics& intrin0,
+    const CameraIntrinsics& intrin1,
+    bool prefer_targetfree,
+    const std::string& cam0_id,
+    const std::string& cam1_id) {
+
+    TwoStageResult result;
+    result.manual_threshold_px = cfg_.max_rms_px;
+
+    UNICALIB_INFO("=== Camera-Camera 两阶段标定 ===");
+    UNICALIB_INFO("  相机0 帧数: {}", frames_cam0.size());
+    UNICALIB_INFO("  相机1 帧数: {}", frames_cam1.size());
+    UNICALIB_INFO("  优先无目标: {}", prefer_targetfree);
+
+    size_t N = std::min(frames_cam0.size(), frames_cam1.size());
+    if (N < 3) {
+        UNICALIB_ERROR("图像对不足 (需≥3)");
+        return result;
+    }
+
+    // ─── Stage 1: 粗标定 (本质矩阵) ───
+    auto coarse_opt = calibrate_essential(
+        frames_cam0, frames_cam1, intrin0, intrin1, cam0_id, cam1_id);
+    if (coarse_opt.has_value()) {
+        result.coarse = coarse_opt;
+        result.coarse_method = "ESSENTIAL_MATRIX";
+        result.coarse_rms = coarse_opt->residual_rms >= 0 ? coarse_opt->residual_rms : -1.0;
+    }
+
+    Sophus::SE3d init_T = (result.coarse.has_value())
+        ? result.coarse->SE3_TargetInRef()
+        : Sophus::SE3d();
+
+    // ─── Stage 2: 精标定 ───
+    std::optional<ExtrinsicSE3> fine_result;
+    if (prefer_targetfree) {
+        std::vector<FeatureMatch> all_matches;
+        for (size_t fi = 0; fi < N; ++fi) {
+            if (frames_cam0[fi].second.empty() || frames_cam1[fi].second.empty())
+                continue;
+            auto fm = match_features(frames_cam0[fi].second, frames_cam1[fi].second,
+                                     intrin0, intrin1);
+            for (auto& m : fm) all_matches.push_back(m);
+        }
+        UNICALIB_INFO("[Fine] 匹配点数: {}, 执行 Bundle Adjustment", all_matches.size());
+        if (all_matches.size() >= 10) {
+            fine_result = bundle_adjustment_two_views(
+                all_matches, intrin0, intrin1, init_T, cam0_id, cam1_id);
+            result.fine_method = "BUNDLE_ADJUSTMENT";
+        }
+    } else {
+        UNICALIB_INFO("[Fine] 执行棋盘格立体标定");
+        fine_result = calibrate_stereo(
+            frames_cam0, frames_cam1, intrin0, intrin1, cam0_id, cam1_id);
+        result.fine_method = "CHESSBOARD_STEREO";
+    }
+
+    if (fine_result.has_value()) {
+        result.fine = fine_result;
+        result.fine_rms = fine_result->residual_rms;
+        result.needs_manual = (result.fine_rms > 0 && result.fine_rms > result.manual_threshold_px);
+        UNICALIB_INFO("[Fine] 标定完成: RMS={:.3f}px converged={}",
+                      result.fine_rms, fine_result->is_converged ? "yes" : "no");
+        if (result.needs_manual) {
+            UNICALIB_WARN("[Fine] RMS={:.3f}px > 阈值={:.3f}px，建议手动校准",
+                          result.fine_rms, result.manual_threshold_px);
+        }
+    } else {
+        UNICALIB_WARN("[Fine] 精标定未得到结果");
+    }
+
+    return result;
+}
+
 // ===================================================================
 // 方法 B: 本质矩阵法
 // ===================================================================

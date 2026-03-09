@@ -146,7 +146,7 @@ public:
         double ransac_thresh_px     = 2.0;
         int    ceres_max_iter       = 100;
         bool   show_residual_map    = true; // 显示残差热力图
-        std::string output_dir      = "./calib_output/manual";
+        std::string output_dir      = "./results/manual";
     };
 
     explicit ManualClickRefiner(const Config& cfg) : cfg_(cfg) {}
@@ -243,7 +243,7 @@ class ManualCalibSession {
 public:
     struct SessionConfig {
         std::string session_id;             // 唯一标识, 空则自动生成时间戳
-        std::string save_dir = "./calib_output/manual_sessions";
+        std::string save_dir = "./results/manual_sessions";
         bool auto_save = true;              // 每次调整后自动保存
         bool log_all_steps = true;          // 详细记录每步
     };

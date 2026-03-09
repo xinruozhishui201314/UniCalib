@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
     print_banner();
 
     std::string config_file, method_str = "ba";
-    std::string output_dir = "./calib_output/cam_cam";
+    std::string output_dir = "./results";
     std::string log_level  = "info";
     bool do_manual   = false;
     bool prefer_tf   = true;

@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
 
     std::string config_file, bag_file;
     std::string ai_root    = "../";
-    std::string output_dir = "./calib_output/imu_lidar";
+    std::string output_dir = "./results";
     std::string log_level  = "info";
     bool do_coarse = false;
     bool do_manual = false;

@@ -162,10 +162,11 @@ public:
     struct Config {
         std::string python_exe      = "python3";
         std::string repo_dir;                          // Transformer-IMU-Calibrator 根目录
-        std::string eval_script     = "eval.py";
-        std::string model_weights   = "weights/tic_model.pt";
+        std::string eval_script     = "eval_unicalib.py";  // UniCalib 入口：--imu_data/--weights/--output_dir
+        std::string model_weights   = "model/TIC_13.pth"; // 与仓库 model/TIC_13.pth 一致，确保加载
         int         timeout_sec     = 60;
         std::string work_dir        = "/tmp/transformer_imu_work";
+        bool        use_mean_only   = false;           // 单 IMU 时传 --mean-only，避免 6× 复制影响精度
     };
 
     explicit TransformerIMUAdapter(const Config& cfg) : cfg_(cfg) {}
@@ -175,8 +176,11 @@ public:
         const std::vector<IMUFrame>& imu_data,
         const std::string& output_dir = "") const;
 
-    // 检查模型是否可用
+    // 检查模型/脚本是否可用（有 repo + 脚本 + 权重 + torch 时为 true）
     bool is_available() const;
+
+    /** 纯 C++ 零偏估计（与 eval_unicalib.py 当前逻辑等价：均值零偏，无模型推理）。不依赖 Python。 */
+    static TransformerIMUResult estimate_native(const std::vector<IMUFrame>& imu_data);
 
 private:
     Config cfg_;

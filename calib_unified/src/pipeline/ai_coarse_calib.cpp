@@ -475,9 +475,65 @@ ExtrinsicSE3 MIASLCECAdapter::parse_output(const std::string& path) const {
 // ===========================================================================
 
 bool TransformerIMUAdapter::is_available() const {
-    if (!fs::exists(cfg_.repo_dir)) return false;
+    if (cfg_.repo_dir.empty()) {
+        UNICALIB_INFO("[TransformerIMU] 不可用: 未配置 third_party.transformer_imu 且环境变量 UNICALIB_TRANSFORMER_IMU 未设置");
+        return false;
+    }
+    if (!fs::exists(cfg_.repo_dir)) {
+        UNICALIB_INFO("[TransformerIMU] 不可用: 仓库目录不存在 repo_dir={}", cfg_.repo_dir);
+        return false;
+    }
     std::string script = cfg_.repo_dir + "/" + cfg_.eval_script;
-    return fs::exists(script) && check_python_module(cfg_.python_exe, "torch");
+    if (!fs::exists(script)) {
+        UNICALIB_INFO("[TransformerIMU] 不可用: 脚本不存在 script={}", script);
+        return false;
+    }
+    std::string model_path = cfg_.repo_dir + "/" + cfg_.model_weights;
+    if (!fs::exists(model_path)) {
+        UNICALIB_INFO("[TransformerIMU] 不可用: 模型文件不存在 model_path={}", model_path);
+        return false;
+    }
+    if (!check_python_module(cfg_.python_exe, "torch")) {
+        UNICALIB_INFO("[TransformerIMU] 不可用: Python 无法 import torch (python_exe={})", cfg_.python_exe);
+        return false;
+    }
+    return true;
+}
+
+TransformerIMUResult TransformerIMUAdapter::estimate_native(
+    const std::vector<IMUFrame>& imu_data) {
+
+    TransformerIMUResult result;
+    result.model_name = "Transformer-IMU-Calibrator(native)";
+
+    if (imu_data.size() < 100) {
+        result.error_msg = "IMU 帧数不足 (need ≥100)";
+        return result;
+    }
+
+    Eigen::Vector3d sum_gyro = Eigen::Vector3d::Zero();
+    Eigen::Vector3d sum_accel = Eigen::Vector3d::Zero();
+    for (const auto& f : imu_data) {
+        sum_gyro += f.gyro;
+        sum_accel += f.accel;
+    }
+    double n = static_cast<double>(imu_data.size());
+    result.coarse_intrin.bias_gyro = sum_gyro / n;
+    Eigen::Vector3d mean_accel = sum_accel / n;
+    double mean_norm = mean_accel.norm();
+    Eigen::Vector3d g = Eigen::Vector3d(0., -9.81, 0.);
+    if (mean_norm > 1e-6) {
+        // 重力自检：g = (mean_accel/‖mean_accel‖)*9.81，与 eval_unicalib.py --gravity-auto 一致，避免 ‖ba‖≈13.9
+        g = mean_accel.normalized() * 9.81;
+        UNICALIB_INFO("[TransformerIMU] 原生零偏: 重力自检 g=({:.4f},{:.4f},{:.4f})", g.x(), g.y(), g.z());
+    }
+    result.coarse_intrin.bias_acce = mean_accel - g;
+    result.success = true;
+    result.confidence = 0.5;
+    double ba_norm = result.coarse_intrin.bias_acce.norm();
+    UNICALIB_INFO("[TransformerIMU] 使用 C++ 原生零偏估计 (无 Python/无模型推理) mean_accel‖={:.4f} ‖ba‖={:.4f} m/s²",
+                  mean_norm, ba_norm);
+    return result;
 }
 
 TransformerIMUResult TransformerIMUAdapter::estimate(
@@ -487,58 +543,64 @@ TransformerIMUResult TransformerIMUAdapter::estimate(
     TransformerIMUResult result;
     result.model_name = "Transformer-IMU-Calibrator";
 
-    if (!is_available()) {
-        result.error_msg = "Transformer-IMU 不可用";
-        UNICALIB_WARN("[TransformerIMU] {}", result.error_msg);
-        return result;
-    }
+    if (is_available()) {
+        UNICALIB_INFO("[TransformerIMU] 从 {} 帧 IMU 数据估计内参 (Python 脚本)", imu_data.size());
+        try {
+            fs::create_directories(cfg_.work_dir);
+            std::string output_dir = output_dir_arg.empty() ?
+                cfg_.work_dir + "/output" : output_dir_arg;
+            fs::create_directories(output_dir);
 
-    UNICALIB_INFO("[TransformerIMU] 从 {} 帧 IMU 数据估计内参", imu_data.size());
+            std::string imu_yaml = cfg_.work_dir + "/imu_data.yaml";
+            serialize_imu_to_yaml(imu_data, imu_yaml);
 
-    try {
-        fs::create_directories(cfg_.work_dir);
-        std::string output_dir = output_dir_arg.empty() ?
-            cfg_.work_dir + "/output" : output_dir_arg;
-        fs::create_directories(output_dir);
+            std::ostringstream cmd;
+            cmd << cfg_.python_exe
+                << " " << cfg_.repo_dir << "/" << cfg_.eval_script
+                << " --imu_data " << imu_yaml
+                << " --weights " << cfg_.repo_dir << "/" << cfg_.model_weights
+                << " --output_dir " << output_dir;
+            if (cfg_.use_mean_only)
+                cmd << " --mean-only";
 
-        // 序列化 IMU 数据
-        std::string imu_yaml = cfg_.work_dir + "/imu_data.yaml";
-        serialize_imu_to_yaml(imu_data, imu_yaml);
+            auto exec_r = exec_cmd(cmd.str(), cfg_.timeout_sec);
+            result.elapsed_ms = exec_r.elapsed_ms;
 
-        std::ostringstream cmd;
-        cmd << cfg_.python_exe
-            << " " << cfg_.repo_dir << "/" << cfg_.eval_script
-            << " --imu_data " << imu_yaml
-            << " --weights " << cfg_.repo_dir << "/" << cfg_.model_weights
-            << " --output_dir " << output_dir;
-
-        auto exec_r = exec_cmd(cmd.str(), cfg_.timeout_sec);
-        result.elapsed_ms = exec_r.elapsed_ms;
-
-        if (exec_r.exit_code != 0) {
-            result.error_msg = "Transformer-IMU 失败";
-            UNICALIB_ERROR("[TransformerIMU] {}", result.error_msg);
-            return result;
-        }
-
-        std::string out_json = output_dir + "/imu_intrinsics.json";
-        if (fs::exists(out_json)) {
-            result.coarse_intrin = parse_output(out_json);
-            result.success    = true;
-            result.confidence = 0.6;
-            UNICALIB_INFO("[TransformerIMU] 粗估 bias_gyro=[{:.6f}, {:.6f}, {:.6f}]",
-                          result.coarse_intrin.bias_gyro.x(),
-                          result.coarse_intrin.bias_gyro.y(),
-                          result.coarse_intrin.bias_gyro.z());
-        } else {
-            result.error_msg = "未找到输出: " + out_json;
+            if (exec_r.exit_code == 0) {
+                std::string out_json = output_dir + "/imu_intrinsics.json";
+                if (fs::exists(out_json)) {
+                    result.coarse_intrin = parse_output(out_json);
+                    result.success    = true;
+                    result.confidence = 0.6;
+                    double ba_norm = result.coarse_intrin.bias_acce.norm();
+                    UNICALIB_INFO("[TransformerIMU] 零偏来源: Python 脚本 ({} 模式)",
+                                  cfg_.use_mean_only ? "mean-only" : "TIC 模型推理");
+                    UNICALIB_INFO("[TransformerIMU] 粗估 bias_gyro=[{:.6f}, {:.6f}, {:.6f}]",
+                                  result.coarse_intrin.bias_gyro.x(),
+                                  result.coarse_intrin.bias_gyro.y(),
+                                  result.coarse_intrin.bias_gyro.z());
+                    UNICALIB_INFO("[TransformerIMU] 粗估 bias_acce=[{:.6f}, {:.6f}, {:.6f}] ‖ba‖={:.4f} m/s²",
+                                  result.coarse_intrin.bias_acce.x(),
+                                  result.coarse_intrin.bias_acce.y(),
+                                  result.coarse_intrin.bias_acce.z(), ba_norm);
+                    if (ba_norm > 15.0) {
+                        UNICALIB_WARN("[TransformerIMU] ‖ba‖={:.2f} 远大于 g，可能为重力方向/坐标系假设不一致，建议配置 use_mean_only+gravity_auto 或补采六面法", ba_norm);
+                    }
+                    return result;
+                }
+            }
+            result.error_msg = "Python 脚本失败或未产出 JSON，回退到 C++ 原生估计";
             UNICALIB_WARN("[TransformerIMU] {}", result.error_msg);
+        } catch (const std::exception& e) {
+            result.error_msg = std::string("TransformerIMU 异常: ") + e.what();
+            UNICALIB_WARN("[TransformerIMU] {} 回退到 C++ 原生估计", result.error_msg);
         }
-    } catch (const std::exception& e) {
-        result.error_msg = std::string("TransformerIMU 异常: ") + e.what();
-        UNICALIB_ERROR("[TransformerIMU] {}", result.error_msg);
+    } else {
+        result.error_msg = "Transformer-IMU 不可用，使用 C++ 原生零偏估计（上方已打印具体原因）";
+        UNICALIB_INFO("[TransformerIMU] {}", result.error_msg);
     }
-    return result;
+
+    return estimate_native(imu_data);
 }
 
 IMUIntrinsics TransformerIMUAdapter::parse_output(const std::string& path) const {

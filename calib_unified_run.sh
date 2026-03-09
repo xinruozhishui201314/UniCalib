@@ -344,7 +344,7 @@ write_and_run() {
             x11_args+=(-v "${HOME}/.Xauthority:/root/.Xauthority:ro")
     fi
 
-    # 执行
+    # 执行（UNICALIB_TRANSFORMER_IMU 与挂载点一致，供 imu-intrin 静态段<6 时使用）
     docker run \
         --rm \
         ${interactive} \
@@ -359,6 +359,7 @@ write_and_run() {
         -e CALIB_RESULTS_DIR="${CONTAINER_RESULTS}" \
         -e CALIB_LOGS_DIR="${CONTAINER_LOGS}" \
         -e AI_ROOT="${CONTAINER_AI}" \
+        -e UNICALIB_TRANSFORMER_IMU="${CONTAINER_AI}/Transformer-IMU-Calibrator" \
         -e PYTHONPATH="${CONTAINER_AI}/DM-Calib:${CONTAINER_AI}/learn-to-calibrate:${CONTAINER_AI}/learn-to-calibrate/rl_solver:${CONTAINER_AI}/MIAS-LCEC:${CONTAINER_AI}/Transformer-IMU-Calibrator" \
         -v "${CALIB_UNIFIED_DIR}:${CONTAINER_CALIB}:rw" \
         -v "${BUILD_DIR}:${CONTAINER_BUILD}:rw" \
@@ -423,11 +424,25 @@ for f in \
 done
 
 echo ""
+echo "■ LibTorch (C++):"
+echo "  calib_unified 未链接 LibTorch，无法在 C++ 中直接加载 .pth 模型"
+found=\$(find /usr /opt -name "libtorch*" -o -path "*libtorch*/lib/*.so" 2>/dev/null | head -1)
+if [[ -n "\${found}" ]]; then
+    echo "  系统存在 LibTorch: \${found} (当前构建未使用)"
+else
+    echo "  未检测到 LibTorch (imu-intrin 不依赖: 静态段<6 时用 C++ 原生零偏估计)"
+fi
+
+echo ""
 echo "■ Python 环境:"
 printf "  python3: %s\n" "\$(python3 --version)"
 python3 -c "import torch; print('  torch  : ' + torch.__version__)" 2>/dev/null || echo "  torch  : 未安装"
 python3 -c "import diffusers; print('  diffusers: OK')" 2>/dev/null || echo "  diffusers: 未安装 (DM-Calib不可用)"
 python3 -c "import yaml; print('  pyyaml : OK')" 2>/dev/null || echo "  pyyaml : 未安装"
+
+echo ""
+echo "■ IMU 内参 (静态段<6 时):"
+echo "  无 Python/无 Transformer-IMU 时自动使用 C++ 原生零偏估计，标定仍可完成"
 
 echo ""
 echo "■ AI 模型挂载点:"
@@ -794,6 +809,7 @@ echo "│  数据目录: ${CONTAINER_DATA}  (宿主机: 请将数据放入 CALIB
 echo "│  结果目录: ${CONTAINER_RESULTS}"
 echo "│  可执行:   \${EXE}"
 echo "│  选项:     coarse=${coarse}  manual=${manual}"
+echo "│  IMU 备选: UNICALIB_TRANSFORMER_IMU=\${UNICALIB_TRANSFORMER_IMU:-未设置}"
 echo "└─────────────────────────────────────────────────────────────────────────┘"
 echo "  详细任务说明与数据要求: 宿主机执行 ./calib_unified_run.sh --task-help"
 echo ""
@@ -920,6 +936,7 @@ do_shell() {
         -e DISPLAY="${DISPLAY:-:0}" \
         -e CALIB_DATA_DIR="${CONTAINER_DATA}" \
         -e CALIB_RESULTS_DIR="${CONTAINER_RESULTS}" \
+        -e UNICALIB_TRANSFORMER_IMU="${CONTAINER_AI}/Transformer-IMU-Calibrator" \
         -v "${CALIB_UNIFIED_DIR}:${CONTAINER_CALIB}:rw" \
         -v "${BUILD_DIR}:${CONTAINER_BUILD}:rw" \
         -v "${CALIB_DATA_DIR}:${CONTAINER_DATA}:rw" \

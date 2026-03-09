@@ -139,7 +139,7 @@ public:
         CamCamCalibrator::Config cam_cam_cfg;
 
         // 输出配置
-        std::string output_dir = "./calib_output";
+        std::string output_dir = "./results";
         bool save_yaml = true;
         bool save_json = true;
         bool generate_html_report = true;

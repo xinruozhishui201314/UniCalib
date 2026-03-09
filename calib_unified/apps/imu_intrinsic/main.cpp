@@ -16,6 +16,8 @@
 #include "unicalib/common/accuracy_logger.h"
 #include "unicalib/intrinsic/imu_intrinsic_calib.h"
 #include "unicalib/viz/report_gen.h"
+#include "unicalib/pipeline/ai_coarse_calib.h"
+#include "unicalib/extrinsic/imu_lidar_calib.h"
 #include <yaml-cpp/yaml.h>
 #include <iostream>
 #include <fstream>
@@ -25,8 +27,21 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <cstdlib>
+#if defined(UNICALIB_WITH_ROS2) && UNICALIB_WITH_ROS2
+#include "unicalib/io/ros2_data_source.h"
+#endif
 
 namespace fs = std::filesystem;
+
+// 解析数据路径：相对路径与 base 拼接；绝对路径原样返回
+static std::string resolve_data_path(const std::string& base, const std::string& path) {
+    if (path.empty()) return "";
+    if (base.empty()) return path;
+    fs::path p(path);
+    if (p.is_absolute()) return path;
+    return (fs::path(base) / p).lexically_normal().string();
+}
 
 // ===================================================================
 // 配置解析
@@ -34,9 +49,19 @@ namespace fs = std::filesystem;
 struct AppConfig {
     std::string sensor_id = "imu_0";
     std::string data_file;          // CSV 文件: timestamp,gx,gy,gz,ax,ay,az
-    std::string data_dir;           // 或目录(含 imu.csv)
-    std::string output_dir = "./calib_output/imu_intrinsic";
+    std::string data_dir;           // 或目录(含 imu.csv)；ROS2 bag 时用于解析 ros2_bag_file 相对路径
+    std::string output_dir = "./results";
     ns_unicalib::IMUIntrinsicCalibrator::Config calib_cfg;
+    // ROS2 bag 模式（与 unicalib_example.yaml 中 ros2 段一致）
+    bool use_ros2_bag = false;
+    std::string ros2_bag_file;
+    std::string imu_ros2_topic;     // 来自 ros2.imu_topic 或 sensors 中第一个 IMU 的 topic
+    bool ros2_strict_topic_match = true;  // 配置话题在 bag 中无数据则失败，不自动回退
+    // 六面法静态段不足(<6)时，使用 Transformer-IMU-Calibrator 作为备选（参考最新 IMU 标定研究）
+    std::string transformer_imu_path;  // third_party.transformer_imu 或环境变量 UNICALIB_TRANSFORMER_IMU
+    std::string transformer_imu_model_weights;  // 可选，默认 model/TIC_13.pth
+    bool use_transformer_fallback_when_insufficient_static = true;
+    bool transformer_imu_mean_only = false;      // 单 IMU 时传 --mean-only，避免 6× 复制降低精度
 };
 
 AppConfig parse_config(int argc, char** argv) {
@@ -56,7 +81,27 @@ AppConfig parse_config(int argc, char** argv) {
                         if (node["data"]["imu"] && node["data"]["imu"][cfg.sensor_id]) {
                             cfg.data_file = node["data"]["imu"][cfg.sensor_id].as<std::string>();
                         }
+                        if (cfg.imu_ros2_topic.empty() && s["topic"])
+                            cfg.imu_ros2_topic = s["topic"].as<std::string>();
                         break;
+                    }
+                }
+                const YAML::Node ros2_node = node["ros2"];
+                if (ros2_node) {
+                    if (ros2_node["use_ros2_bag"]) cfg.use_ros2_bag = ros2_node["use_ros2_bag"].as<bool>();
+                    if (ros2_node["ros2_bag_file"]) cfg.ros2_bag_file = ros2_node["ros2_bag_file"].as<std::string>();
+                    if (ros2_node["imu_topic"]) cfg.imu_ros2_topic = ros2_node["imu_topic"].as<std::string>();
+                    if (ros2_node["strict_topic_match"]) cfg.ros2_strict_topic_match = ros2_node["strict_topic_match"].as<bool>();
+                }
+                if (cfg.use_ros2_bag) {
+                    cfg.data_file.clear();  // 使用 bag 时不用 data.imu 的 CSV 路径
+                }
+                if (cfg.use_ros2_bag && cfg.imu_ros2_topic.empty()) {
+                    for (const auto& s : node["sensors"]) {
+                        if (s["type"] && s["type"].as<std::string>() == "imu" && s["topic"]) {
+                            cfg.imu_ros2_topic = s["topic"].as<std::string>();
+                            break;
+                        }
                     }
                 }
                 if (node["output_dir"]) cfg.output_dir = node["output_dir"].as<std::string>();
@@ -65,6 +110,15 @@ AppConfig parse_config(int argc, char** argv) {
                     if (ii["static_gyro_thresh"])   cfg.calib_cfg.static_gyro_threshold = ii["static_gyro_thresh"].as<double>();
                     if (ii["static_detect_window"]) cfg.calib_cfg.static_detect_window    = ii["static_detect_window"].as<double>();
                     if (ii["min_static_frames"])   cfg.calib_cfg.min_static_frames      = ii["min_static_frames"].as<int>();
+                    if (ii["use_transformer_fallback_when_insufficient_static"])
+                        cfg.use_transformer_fallback_when_insufficient_static = ii["use_transformer_fallback_when_insufficient_static"].as<bool>(true);
+                    if (ii["transformer_imu_mean_only"])
+                        cfg.transformer_imu_mean_only = ii["transformer_imu_mean_only"].as<bool>(false);
+                }
+                if (node["third_party"]) {
+                    const auto& tp = node["third_party"];
+                    if (tp["transformer_imu"]) cfg.transformer_imu_path = tp["transformer_imu"].as<std::string>("");
+                    if (tp["transformer_imu_model_weights"]) cfg.transformer_imu_model_weights = tp["transformer_imu_model_weights"].as<std::string>("");
                 }
             } else {
                 if (node["sensor_id"])  cfg.sensor_id  = node["sensor_id"].as<std::string>();
@@ -82,24 +136,33 @@ AppConfig parse_config(int argc, char** argv) {
             cfg.sensor_id = argv[++i];
         } else if (arg == "--data_file" && i + 1 < argc) {
             cfg.data_file = argv[++i];
-        } else if (arg == "--data_dir" && i + 1 < argc) {
+        } else if ((arg == "--data_dir" || arg == "--data-dir") && i + 1 < argc) {
             cfg.data_dir = argv[++i];
         } else if (arg == "--output_dir" && i + 1 < argc) {
             cfg.output_dir = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: unicalib_imu_intrinsic [options]\n"
-                      << "  --config <yaml>      配置文件\n"
+                      << "  --config <yaml>      配置文件 (支持统一配置中 ros2.use_ros2_bag)\n"
                       << "  --sensor_id <id>     传感器ID (default: imu_0)\n"
                       << "  --data_file <csv>    IMU数据CSV文件\n"
-                      << "  --data_dir <dir>     数据目录(含 imu.csv)\n"
+                      << "  --data_dir <dir>     数据目录(含 imu.csv 或 ROS2 bag 相对路径根)\n"
+                      << "  --data-dir <dir>     同上 (与脚本 --data-dir 一致)\n"
                       << "  --output_dir <dir>   输出目录\n"
-                      << "\nCSV 格式: timestamp[s],gx,gy,gz[rad/s],ax,ay,az[m/s^2]\n";
+                      << "\nCSV 格式: timestamp[s],gx,gy,gz[rad/s],ax,ay,az[m/s^2]\n"
+                      << "ROS2 bag: 在 config 中设置 ros2.use_ros2_bag: true 与 ros2.ros2_bag_file，并传入 --data-dir。\n"
+                      << "六面法静态段不足时，可配置 third_party.transformer_imu 使用 Transformer-IMU-Calibrator 备选。\n";
             exit(0);
         }
     }
 
     if (cfg.data_file.empty() && !cfg.data_dir.empty()) {
         cfg.data_file = cfg.data_dir + "/imu.csv";
+    }
+
+    // 环境变量备选：Transformer-IMU-Calibrator 路径
+    if (cfg.transformer_imu_path.empty()) {
+        const char* env_ti = std::getenv("UNICALIB_TRANSFORMER_IMU");
+        if (env_ti && env_ti[0]) cfg.transformer_imu_path = env_ti;
     }
 
     return cfg;
@@ -156,9 +219,14 @@ int main(int argc, char** argv) {
     // 解析配置
     auto cfg = parse_config(argc, argv);
 
-    if (cfg.data_file.empty()) {
+    if (cfg.data_dir.empty()) {
+        const char* env_data = std::getenv("CALIB_DATA_DIR");
+        if (env_data && env_data[0]) cfg.data_dir = env_data;
+    }
+
+    if (!cfg.use_ros2_bag && cfg.data_file.empty()) {
         ns_unicalib::Logger::init("UniCalib-IMU-Intrinsic");
-        UNICALIB_ERROR("No data file specified. Use --data_file or --config");
+        UNICALIB_ERROR("No data source: set ros2.use_ros2_bag + ros2.ros2_bag_file in config and pass --data-dir, or set data.imu.<id> / --data_file for CSV");
         return 1;
     }
 
@@ -169,9 +237,51 @@ int main(int argc, char** argv) {
     ns_unicalib::Logger::init("UniCalib-IMU-Intrinsic", log_file, spdlog::level::info);
     UNICALIB_INFO("日志文件: {}", log_file);
 
-    // 加载 IMU 数据
-    UNICALIB_INFO("Loading IMU data from: {}", cfg.data_file);
-    auto imu_data = load_imu_csv(cfg.data_file);
+    ns_unicalib::IMURawData imu_data;
+    if (cfg.use_ros2_bag) {
+#if defined(UNICALIB_WITH_ROS2) && UNICALIB_WITH_ROS2
+        std::string bag_path = cfg.ros2_bag_file;
+        if (!bag_path.empty() && !cfg.data_dir.empty()) {
+            fs::path p(bag_path);
+            if (!p.is_absolute())
+                bag_path = resolve_data_path(cfg.data_dir, cfg.ros2_bag_file);
+        }
+        if (bag_path.empty()) {
+            UNICALIB_ERROR("ROS2 bag 模式需要配置 ros2.ros2_bag_file 并传入 --data-dir 或 CALIB_DATA_DIR");
+            return 1;
+        }
+        if (!fs::exists(bag_path)) {
+            UNICALIB_ERROR("ROS2 bag 路径不存在: {}", bag_path);
+            return 1;
+        }
+        std::string imu_topic = cfg.imu_ros2_topic.empty() ? "/imu/data" : cfg.imu_ros2_topic;
+        ns_unicalib::RosDataSourceConfig ros_cfg;
+        ros_cfg.bag_file = bag_path;
+        ros_cfg.imu_topics[cfg.sensor_id] = imu_topic;
+        ros_cfg.imu_ros2_topic = imu_topic;
+        ros_cfg.strict_topic_match = cfg.ros2_strict_topic_match;
+        auto ros_source = ns_unicalib::create_ros_data_source(ros_cfg);
+        if (!ros_source || !ros_source->load()) {
+            UNICALIB_ERROR("从 ROS2 bag 加载失败: {}", ros_source ? ros_source->get_status_message() : "create failed");
+            return 1;
+        }
+        auto ros_frames = ros_source->get_imu_frames(cfg.sensor_id);
+        for (const auto& fr : ros_frames) {
+            ns_unicalib::IMURawFrame raw;
+            raw.timestamp = fr.timestamp;
+            raw.gyro  = Eigen::Vector3d(fr.gyro[0], fr.gyro[1], fr.gyro[2]);
+            raw.accel = Eigen::Vector3d(fr.accel[0], fr.accel[1], fr.accel[2]);
+            imu_data.push_back(raw);
+        }
+        UNICALIB_INFO("Loading IMU data from ROS2 bag: {} (topic: {}, {} frames)", bag_path, imu_topic, imu_data.size());
+#else
+        UNICALIB_ERROR("ROS2 bag 需要编译时启用 ROS2 (UNICALIB_WITH_ROS2)。请使用 CSV 或使用带 ROS2 的构建。");
+        return 1;
+#endif
+    } else {
+        UNICALIB_INFO("Loading IMU data from: {}", cfg.data_file);
+        imu_data = load_imu_csv(cfg.data_file);
+    }
 
     if (imu_data.size() < 1000) {
         UNICALIB_ERROR("Insufficient IMU data: {} frames (need ≥ 1000)", imu_data.size());
@@ -206,6 +316,46 @@ int main(int argc, char** argv) {
 
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
     UNICALIB_INFO("Calibration took {:.1f} s", elapsed);
+
+    // 六面法静态段不足(<6)时：优先 Python 脚本（若配置），否则自动用 C++ 原生零偏估计（无 Python/无模型）
+    auto segments = calibrator.detect_static_segments(imu_data);
+    if (segments.size() < 6 && cfg.use_transformer_fallback_when_insufficient_static) {
+        std::vector<ns_unicalib::IMUFrame> imu_frames;
+        imu_frames.reserve(imu_data.size());
+        for (const auto& fr : imu_data) {
+            ns_unicalib::IMUFrame f;
+            f.timestamp = fr.timestamp;
+            f.gyro  = fr.gyro;
+            f.accel = fr.accel;
+            imu_frames.push_back(f);
+        }
+        if (cfg.transformer_imu_path.empty()) {
+            UNICALIB_INFO("[UniCalib-IMU-Intrinsic] Transformer-IMU 路径未配置 (third_party.transformer_imu / UNICALIB_TRANSFORMER_IMU)，将使用 C++ 原生零偏估计");
+        } else {
+            UNICALIB_INFO("[UniCalib-IMU-Intrinsic] Transformer-IMU 路径: {}", cfg.transformer_imu_path);
+        }
+        ns_unicalib::TransformerIMUAdapter::Config ti_cfg;
+        ti_cfg.repo_dir = cfg.transformer_imu_path;
+        ti_cfg.work_dir = cfg.output_dir + "/transformer_imu_work";
+        if (!cfg.transformer_imu_model_weights.empty())
+            ti_cfg.model_weights = cfg.transformer_imu_model_weights;
+        ti_cfg.use_mean_only = cfg.transformer_imu_mean_only;
+        ns_unicalib::TransformerIMUAdapter adapter(ti_cfg);
+        auto ti_result = adapter.estimate(imu_frames, cfg.output_dir + "/transformer_imu_out");
+        if (ti_result.success) {
+            intrin.bias_gyro = ti_result.coarse_intrin.bias_gyro;
+            intrin.bias_acce = ti_result.coarse_intrin.bias_acce;
+            double ba_norm = intrin.bias_acce.norm();
+            UNICALIB_INFO("六面法静态段不足 ({} < 6)，零偏来源: {} (备选路径)", segments.size(), ti_result.model_name);
+            UNICALIB_INFO("  bias_gyro=[{:.6f}, {:.6f}, {:.6f}] (陀螺零偏为均值/模型粗估，可作初值)", intrin.bias_gyro.x(), intrin.bias_gyro.y(), intrin.bias_gyro.z());
+            UNICALIB_INFO("  bias_acce=[{:.6f}, {:.6f}, {:.6f}] ‖ba‖={:.4f} m/s²", intrin.bias_acce.x(), intrin.bias_acce.y(), intrin.bias_acce.z(), ba_norm);
+            if (ba_norm > 15.0) {
+                UNICALIB_WARN("加速度计零偏 ‖ba‖={:.2f} 远大于 g≈9.81，多为重力方向/坐标系假设不一致，下游慎用；建议启用 transformer_imu_mean_only + 脚本 --gravity-auto 或补采六面法数据", ba_norm);
+            }
+        } else {
+            UNICALIB_WARN("零偏备选未成功: {}", ti_result.error_msg.empty() ? "unknown" : ti_result.error_msg);
+        }
+    }
 
     // 保存 Allan 偏差图
     std::string allan_plot_path = cfg.output_dir + "/allan_gyro.png";
@@ -266,8 +416,13 @@ int main(int argc, char** argv) {
               << std::setprecision(4) << intrin.noise_gyro << " │\n";
     std::cout << "│ 陀螺零偏不稳 (rad/s) │ " << std::setw(27) << intrin.bias_instab_gyro << " │\n";
     std::cout << "│ 加速计噪声 (m/s²/√Hz)│ " << std::setw(27) << intrin.noise_acce << " │\n";
-    std::cout << "│ 加速计零偏 (m/s²)    │ " << std::setw(27) << intrin.bias_instab_acce << " │\n";
+    std::cout << "│ 加速计零偏不稳 (m/s²)│ " << std::setw(27) << intrin.bias_instab_acce << " │\n";
+    double ba_norm = intrin.bias_acce.norm();
+    std::cout << "│ 加速计零偏 ‖ba‖(m/s²)│ " << std::setw(27) << std::scientific << std::setprecision(4) << ba_norm << " │\n";
     std::cout << "└──────────────────────┴─────────────────────────────┘\n";
+    if (ba_norm > 15.0) {
+        std::cout << "⚠ ‖ba‖ 过大，请检查零偏来源与重力假设（见上方日志）\n";
+    }
     std::cout << "\n结果保存至: " << cfg.output_dir << "\n\n";
 
     UNICALIB_MAIN_TRY_END(0)

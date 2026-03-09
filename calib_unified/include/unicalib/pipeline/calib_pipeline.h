@@ -28,6 +28,8 @@
 #include "unicalib/common/calib_param.h"
 #include "unicalib/common/sensor_types.h"
 #include "unicalib/extrinsic/lidar_camera_calib.h"
+#include "unicalib/extrinsic/cam_cam_calib.h"
+#include "unicalib/intrinsic/imu_intrinsic_calib.h"
 #include <opencv2/core.hpp>
 #include <chrono>
 #include <functional>
@@ -152,9 +154,10 @@ struct PipelineConfig {
     double lidar_cam_rms_threshold  = 2.0;   // px
     double cam_cam_rms_threshold    = 1.5;   // px
     double imu_lidar_rot_threshold  = 0.5;   // deg
+    double imu_intrin_rms_threshold = 0.1;   // Allan拟合残差阈值 [rad/s]
 
     // 输出目录
-    std::string output_dir          = "./calib_output";
+    std::string output_dir          = "./results";
 
     // 日志级别: trace/debug/info/warn/error
     std::string log_level           = "info";
@@ -165,9 +168,21 @@ struct PipelineConfig {
     // ─── 数据路径配置 (LiDAR-Camera 标定) ───
     std::string lidar_data_dir;              // LiDAR 点云目录 (PCD)
     std::string camera_images_dir;           // 相机图像目录
-    std::string camera_intrinsic_file;       // 相机内参 YAML (可选)
+    std::string camera_intrinsic_file;       // 相机内参 YAML (可选，单目时用)
     std::string lidar_id        = "lidar_front";
     std::string camera_id       = "cam_left";
+
+    // ─── 多传感器话题（全可配置）：sensor_id -> ROS2 话题；非空时用于数据加载与标定
+    std::map<std::string, std::string> lidar_topics;
+    std::map<std::string, std::string> camera_topics;
+    std::map<std::string, std::string> imu_topics;
+    // 多相机内参文件 (sensor_id -> yaml 路径)，cam-cam 时若 params 中无内参则按需加载
+    std::map<std::string, std::string> camera_intrinsic_files;
+
+    // ─── 全自动标定：为 true 时根据 sensors 数量自动开启对应任务（见下方说明）
+    bool auto_tasks = false;
+    // auto_tasks 时：有 IMU -> do_imu_intrinsic；有相机 -> do_camera_intrinsic；
+    // 相机≥2 -> do_cam_cam_extrinsic；有 IMU+LiDAR -> do_imu_lidar_extrinsic；有 LiDAR+相机 -> do_lidar_camera_extrinsic
 
     // ─── ROS2 数据源配置 (新增) ───
     bool use_ros2_bag = false;             // 是否使用 ROS2 bag 文件
@@ -179,6 +194,7 @@ struct PipelineConfig {
     double ros2_max_wait_time = 30.0;     // ROS2 实时模式最大等待时间(秒)
     double ros2_sample_interval = 0.0;     // ROS2 数据采样间隔(秒)
     size_t ros2_max_frames = 100;         // ROS2 最大帧数限制
+    bool   ros2_strict_topic_match = true; // 为 true 时配置话题在 bag 中无数据则加载失败，不自动回退
 
     // ─── LiDAR-Camera 标定参数 ───
     // 方法: "edge"(无目标边缘对齐) | "target"(棋盘格) | "motion"(B样条运动)
@@ -193,6 +209,11 @@ struct PipelineConfig {
     int    edge_canny_low  = 50;
     int    edge_canny_high = 150;
     int    ceres_max_iter  = 50;
+
+    // ─── IMU 内参标定配置 ───
+    std::string imu_sensor_id   = "imu_0";  // IMU传感器ID
+    std::string imu_data_file;               // CSV文件路径 (备用)
+    ns_unicalib::IMUIntrinsicCalibrator::Config imu_intrinsic_calib_cfg;
 };
 
 // ===========================================================================
@@ -267,9 +288,11 @@ protected:
     std::map<std::string, std::shared_ptr<spdlog::logger>> stage_loggers_;
 
     // -----------------------------------------------------------------------
-    // LiDAR-Camera 精标定内部实现
+    // LiDAR-Camera / Camera-Camera 精标定内部实现
     // -----------------------------------------------------------------------
     StageResult run_fine_lidar_camera();
+    StageResult run_fine_cam_cam();
+    StageResult run_fine_imu_intrinsic();  // IMU 内参精标定
 
     // 从图像推断内参 (无内参文件时使用)
     CameraIntrinsics infer_intrinsics_from_images(
@@ -279,6 +302,10 @@ protected:
     void save_extrinsic_result(
         const std::string& path,
         const LiDARCameraCalibrator::TwoStageResult& result) const;
+
+    // 保存 IMU 内参结果到 YAML
+    void save_imu_intrinsic_yaml(const ns_unicalib::IMUIntrinsics& intrinsics,
+                                 const std::string& path) const;
 };
 
 }  // namespace ns_unicalib

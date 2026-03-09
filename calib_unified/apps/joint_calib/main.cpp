@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 using namespace ns_unicalib;
@@ -159,8 +160,23 @@ static void print_help() {
         "  --check-ai             只检查 AI 模型可用性\n\n"
         "日志/输出:\n"
         "  --log-level <l>        trace|debug|info|warn|error\n"
-        "  --output-dir <dir>     输出目录 (默认 ./calib_output)\n\n"
+        "  --output-dir <dir>     输出目录 (默认 ./results)\n"
+        "  --data-dir <dir>       数据根目录 (与 config 中相对路径/ros2_bag_file 拼接；也可用 CALIB_DATA_DIR)\n\n"
         "配置文件: config/unicalib_example.yaml（全工程唯一）\n\n";
+}
+
+// 解析数据路径：相对路径与 base 拼接；占位符 /path/to/xxx 视为 base+xxx；绝对路径原样返回
+static std::string resolve_data_path(const std::string& base, const std::string& path) {
+    if (path.empty()) return "";
+    std::string work = path;
+    const char prefix[] = "/path/to/";
+    if (!base.empty() && work.size() >= sizeof(prefix) - 1 &&
+        work.compare(0, sizeof(prefix) - 1, prefix) == 0)
+        work = work.substr(sizeof(prefix) - 1);
+    if (base.empty()) return path;
+    fs::path p(work);
+    if (p.is_absolute()) return path;
+    return (fs::path(base) / p).lexically_normal().string();
 }
 
 // 打印任务选择摘要
@@ -186,8 +202,9 @@ int main(int argc, char** argv) {
 
     std::string config_file;
     std::string ai_root    = "../";
-    std::string output_dir = "./calib_output/joint";
+    std::string output_dir = "./results";
     std::string log_level  = "info";
+    std::string data_dir;  // 数据根目录，空则用 CALIB_DATA_DIR（配合 --dataset 时脚本会设置）
 
     bool do_coarse   = false;
     bool do_manual   = false;
@@ -220,6 +237,7 @@ int main(int argc, char** argv) {
         else if (a == "--check-ai")        check_ai  = true;
         else if (a == "--ai-root" && i+1 < argc)   ai_root = argv[++i];
         else if (a == "--output-dir" && i+1 < argc) output_dir = argv[++i];
+        else if (a == "--data-dir" && i+1 < argc)   data_dir = argv[++i];
         else if (a == "--log-level" && i+1 < argc)  log_level = argv[++i];
         else if (a == "--help" || a == "-h") { print_help(); return 0; }
     }
@@ -278,11 +296,33 @@ int main(int argc, char** argv) {
     if (cfg["prefer_targetfree"]) prefer_tf = cfg["prefer_targetfree"].as<bool>();
     if (cfg["ai_root"])      ai_root = cfg["ai_root"].as<std::string>();
 
-    // 若 YAML 中存在 do_* 任务开关，则覆盖命令行（联合标定以配置文件为准）
+    // 全自动标定：根据 sensors 数量自动决定执行哪些任务（话题与数量均来自配置）
+    bool auto_tasks = cfg["auto_tasks"] && cfg["auto_tasks"].as<bool>();
+    if (auto_tasks) {
+        size_t n_imu = 0, n_lidar = 0, n_cam = 0;
+        for (const auto& s : sys_cfg.sensors) {
+            if (s.type == SensorType::IMU)    n_imu++;
+            if (s.type == SensorType::LiDAR)  n_lidar++;
+            if (s.type == SensorType::CAMERA) n_cam++;
+        }
+        do_imu_intrin = (n_imu >= 1);
+        do_cam_intrin = (n_cam >= 1);
+        do_cam_cam    = (n_cam >= 2);
+        do_imu_lidar  = (n_imu >= 1 && n_lidar >= 1);
+        do_lidar_cam  = (n_lidar >= 1 && n_cam >= 1);
+        tasks = CalibTaskType::NONE;
+        if (do_imu_intrin) tasks = tasks | CalibTaskType::IMU_INTRINSIC;
+        if (do_cam_intrin) tasks = tasks | CalibTaskType::CAM_INTRINSIC;
+        if (do_imu_lidar)  tasks = tasks | CalibTaskType::IMU_LIDAR_EXTRIN;
+        if (do_lidar_cam)  tasks = tasks | CalibTaskType::LIDAR_CAM_EXTRIN;
+        if (do_cam_cam)    tasks = tasks | CalibTaskType::CAM_CAM_EXTRIN;
+        UNICALIB_INFO("auto_tasks=true: 传感器 IMU={} LiDAR={} 相机={} → 已自动勾选任务", n_imu, n_lidar, n_cam);
+    }
+    // 若 YAML 中存在 do_* 任务开关且未开 auto_tasks，则覆盖命令行（联合标定以配置文件为准）
     bool yaml_has_do_flags = cfg["do_imu_intrinsic"] || cfg["do_camera_intrinsic"] ||
                              cfg["do_imu_lidar_extrinsic"] || cfg["do_lidar_camera_extrinsic"] ||
                              cfg["do_cam_cam_extrinsic"];
-    if (yaml_has_do_flags) {
+    if (!auto_tasks && yaml_has_do_flags) {
         if (cfg["do_imu_intrinsic"])         do_imu_intrin = cfg["do_imu_intrinsic"].as<bool>();
         if (cfg["do_camera_intrinsic"])       do_cam_intrin = cfg["do_camera_intrinsic"].as<bool>();
         if (cfg["do_imu_lidar_extrinsic"])   do_imu_lidar  = cfg["do_imu_lidar_extrinsic"].as<bool>();
@@ -344,6 +384,9 @@ int main(int argc, char** argv) {
     if (cfg["imu_lidar_rot_threshold"])
         pipe_cfg.imu_lidar_rot_threshold = cfg["imu_lidar_rot_threshold"].as<double>();
 
+    // ─── 数据根目录（用于解析相对路径的 ros2_bag_file / data 路径）────────────────
+    std::string base_data_dir = data_dir.empty() ? (std::getenv("CALIB_DATA_DIR") ? std::getenv("CALIB_DATA_DIR") : "") : data_dir;
+
     // ─── ROS2 / 传感器话题：默认从配置文件 sensors 与 ros2 段读取 ───
     const YAML::Node ros2_node = cfg["ros2"];
     if (ros2_node) {
@@ -353,27 +396,52 @@ int main(int argc, char** argv) {
         if (ros2_node["max_wait_time"])  pipe_cfg.ros2_max_wait_time = ros2_node["max_wait_time"].as<double>();
         if (ros2_node["sample_interval"]) pipe_cfg.ros2_sample_interval = ros2_node["sample_interval"].as<double>();
         if (ros2_node["max_frames"])     pipe_cfg.ros2_max_frames = ros2_node["max_frames"].as<size_t>();
-        if (ros2_node["lidar_topic"])    pipe_cfg.lidar_ros2_topic  = ros2_node["lidar_topic"].as<std::string>();
+        if (ros2_node["lidar_topic"])     pipe_cfg.lidar_ros2_topic  = ros2_node["lidar_topic"].as<std::string>();
         if (ros2_node["camera_topic"])   pipe_cfg.camera_ros2_topic = ros2_node["camera_topic"].as<std::string>();
         if (ros2_node["imu_topic"])      pipe_cfg.imu_ros2_topic    = ros2_node["imu_topic"].as<std::string>();
+        if (ros2_node["strict_topic_match"]) pipe_cfg.ros2_strict_topic_match = ros2_node["strict_topic_match"].as<bool>();
     }
-    // 话题未在 ros2 段指定时，默认从 sensors[].topic 按类型取第一个
+    if (pipe_cfg.ros2_bag_file.empty() && cfg["data"] && cfg["data"]["bag_file"])
+        pipe_cfg.ros2_bag_file = cfg["data"]["bag_file"].as<std::string>();
+    if (pipe_cfg.use_ros2_bag && !pipe_cfg.ros2_bag_file.empty() && !base_data_dir.empty()) {
+        fs::path p(pipe_cfg.ros2_bag_file);
+        if (!p.is_absolute())
+            pipe_cfg.ros2_bag_file = resolve_data_path(base_data_dir, pipe_cfg.ros2_bag_file);
+    }
+    // 传感器话题与数量全可配置：从 sensors 按类型填入 lidar_topics / camera_topics / imu_topics
     for (const auto& s : sys_cfg.sensors) {
-        if (s.type == SensorType::LiDAR && pipe_cfg.lidar_ros2_topic.empty() && !s.topic.empty()) {
-            pipe_cfg.lidar_ros2_topic = s.topic;
-            pipe_cfg.lidar_id = s.sensor_id;
+        if (s.type == SensorType::LiDAR && !s.topic.empty()) {
+            pipe_cfg.lidar_topics[s.sensor_id] = s.topic;
+            if (pipe_cfg.lidar_ros2_topic.empty()) {
+                pipe_cfg.lidar_ros2_topic = s.topic;
+                pipe_cfg.lidar_id = s.sensor_id;
+            }
         }
-        if (s.type == SensorType::CAMERA && pipe_cfg.camera_ros2_topic.empty() && !s.topic.empty()) {
-            pipe_cfg.camera_ros2_topic = s.topic;
-            pipe_cfg.camera_id = s.sensor_id;
+        if (s.type == SensorType::CAMERA && !s.topic.empty()) {
+            pipe_cfg.camera_topics[s.sensor_id] = s.topic;
+            if (pipe_cfg.camera_ros2_topic.empty()) {
+                pipe_cfg.camera_ros2_topic = s.topic;
+                pipe_cfg.camera_id = s.sensor_id;
+            }
         }
-        if (s.type == SensorType::IMU && pipe_cfg.imu_ros2_topic.empty() && !s.topic.empty()) {
-            pipe_cfg.imu_ros2_topic = s.topic;
+        if (s.type == SensorType::IMU && !s.topic.empty()) {
+            pipe_cfg.imu_topics[s.sensor_id] = s.topic;
+            if (pipe_cfg.imu_ros2_topic.empty()) {
+                pipe_cfg.imu_ros2_topic = s.topic;
+            }
         }
     }
     for (const auto& s : sys_cfg.sensors) {
         if (s.type == SensorType::LiDAR && pipe_cfg.lidar_id == "lidar_front") pipe_cfg.lidar_id = s.sensor_id;
         if (s.type == SensorType::CAMERA && pipe_cfg.camera_id == "cam_left")  pipe_cfg.camera_id = s.sensor_id;
+    }
+    // 多相机内参文件：从 data.camera 的 intrinsic_yaml 填入
+    if (cfg["data"] && cfg["data"]["camera"]) {
+        for (const auto& it : cfg["data"]["camera"]) {
+            std::string cam_id = it.first.as<std::string>();
+            if (it.second["intrinsic_yaml"])
+                pipe_cfg.camera_intrinsic_files[cam_id] = it.second["intrinsic_yaml"].as<std::string>();
+        }
     }
 
     CalibPipeline pipeline(pipe_cfg);

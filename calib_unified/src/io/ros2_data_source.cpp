@@ -21,7 +21,9 @@
 #include <pcl/PCLPointCloud2.h>
 #include <opencv2/imgcodecs.hpp>
 #include <chrono>
+#include <cmath>
 #include <thread>
+#include <set>
 
 #ifdef UNICALIB_WITH_ROS2
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -51,9 +53,14 @@ double Ros2BagDataSource::stamp_to_sec(const builtin_interfaces::msg::Time& stam
 }
 
 bool Ros2BagDataSource::read_metadata_yaml(const std::string& bag_file) {
-    // 尝试在同目录下查找 metadata.yaml
+    // ROS2 rosbag2 格式：bag 为目录，metadata.yaml 在目录内
     fs::path bag_path(bag_file);
-    fs::path metadata_path = bag_path.parent_path() / "metadata.yaml";
+    fs::path metadata_path;
+    if (fs::is_directory(bag_path)) {
+        metadata_path = bag_path / "metadata.yaml";
+    } else {
+        metadata_path = bag_path.parent_path() / "metadata.yaml";
+    }
     
     if (!fs::exists(metadata_path)) {
         UNICALIB_INFO("[Ros2BagDataSource] 未找到 metadata.yaml: {}", metadata_path.string());
@@ -65,21 +72,42 @@ bool Ros2BagDataSource::read_metadata_yaml(const std::string& bag_file) {
     try {
         YAML::Node root = YAML::LoadFile(metadata_path.string());
         
-        // 查找 topics_with_message_count 节
-        if (!root["topics_with_message_count"]) {
+        // 查找 topics_with_message_count：兼容根节点 或 rosbag2_bagfile_information 下（标准 rosbag2 格式）
+        YAML::Node topics_node = root["topics_with_message_count"];
+        if (!topics_node) {
+            if (root["rosbag2_bagfile_information"]) {
+                topics_node = root["rosbag2_bagfile_information"]["topics_with_message_count"];
+            }
+        }
+        if (!topics_node) {
             UNICALIB_WARN("[Ros2BagDataSource] metadata.yaml 中缺少 topics_with_message_count 节");
             return false;
         }
         
-        // 收集所有话题及其消息数量
+        // 收集所有话题及其消息数量与类型（兼容两种 metadata 格式：name 在顶层 或 在 topic_metadata 下）
         std::map<std::string, size_t> topic_msg_counts;
-        for (const auto& topic_node : root["topics_with_message_count"]) {
-            std::string topic_name = topic_node["name"].as<std::string>();
-            size_t msg_count = topic_node["message_count"].as<size_t>();
+        bag_topic_msg_counts_.clear();
+        bag_topic_types_.clear();
+        for (const auto& topic_node : topics_node) {
+            std::string topic_name;
+            if (topic_node["name"])
+                topic_name = topic_node["name"].as<std::string>();
+            else if (topic_node["topic_metadata"] && topic_node["topic_metadata"]["name"])
+                topic_name = topic_node["topic_metadata"]["name"].as<std::string>();
+            else
+                continue;
+            size_t msg_count = topic_node["message_count"] ? topic_node["message_count"].as<size_t>() : 0;
             topic_msg_counts[topic_name] = msg_count;
-            
-            UNICALIB_DEBUG("[Ros2BagDataSource] 找到话题: {} (消息数: {})", 
-                         topic_name, msg_count);
+            bag_topic_msg_counts_[topic_name] = msg_count;
+            std::string topic_type;
+            if (topic_node["topic_metadata"] && topic_node["topic_metadata"]["type"])
+                topic_type = topic_node["topic_metadata"]["type"].as<std::string>();
+            else if (topic_node["type"])
+                topic_type = topic_node["type"].as<std::string>();
+            if (!topic_type.empty())
+                bag_topic_types_[topic_name] = topic_type;
+            UNICALIB_DEBUG("[Ros2BagDataSource] 找到话题: {} (类型: {}, 消息数: {})",
+                         topic_name, topic_type.empty() ? "?" : topic_type, msg_count);
         }
         
         // 自动检测话题类型
@@ -327,20 +355,18 @@ IMUFrameRos Ros2BagDataSource::parse_imu(
     IMUFrameRos frame;
     frame.timestamp = stamp_to_sec(msg->header.stamp);
     
-    if (msg->angular_velocity.x == msg->angular_velocity.x &&
-        msg->linear_acceleration.x == msg->linear_acceleration.x) {
-        // 检查是否为 NaN
-        frame.gyro[0] = 0.0; frame.gyro[1] = 0.0; frame.gyro[2] = 0.0;
-        frame.accel[0] = 0.0; frame.accel[1] = 0.0; frame.accel[2] = 0.0;
-    } else {
-        frame.gyro[0] = msg->angular_velocity.x;
-        frame.gyro[1] = msg->angular_velocity.y;
-        frame.gyro[2] = msg->angular_velocity.z;
-        frame.accel[0] = msg->linear_acceleration.x;
-        frame.accel[1] = msg->linear_acceleration.y;
-        frame.accel[2] = msg->linear_acceleration.z;
+    auto safe_gyro = [&msg](int i) -> double {
+        double v = (i == 0) ? msg->angular_velocity.x : (i == 1) ? msg->angular_velocity.y : msg->angular_velocity.z;
+        return (std::isnan(v) || std::isinf(v)) ? 0.0 : v;
+    };
+    auto safe_accel = [&msg](int i) -> double {
+        double v = (i == 0) ? msg->linear_acceleration.x : (i == 1) ? msg->linear_acceleration.y : msg->linear_acceleration.z;
+        return (std::isnan(v) || std::isinf(v)) ? 0.0 : v;
+    };
+    for (int i = 0; i < 3; ++i) {
+        frame.gyro[i] = safe_gyro(i);
+        frame.accel[i] = safe_accel(i);
     }
-    
     return frame;
 }
 
@@ -384,91 +410,238 @@ bool Ros2BagDataSource::load() {
         const auto& topics = bag_reader_->get_all_topics_and_types();
         UNICALIB_INFO("[Ros2BagDataSource] 找到 {} 个话题", topics.size());
         for (const auto& meta : topics) {
-            UNICALIB_DEBUG("  话题: {} (类型: {})", meta.name, meta.type);
+            auto it_count = bag_topic_msg_counts_.find(meta.name);
+            size_t count = (it_count != bag_topic_msg_counts_.end()) ? it_count->second : 0;
+            UNICALIB_INFO("[Ros2BagDataSource]  话题: {}  类型: {}  消息数: {}",
+                         meta.name, meta.type, count);
         }
+
+        // 按类型收集 bag 内所有话题，便于“接收所有、选择使用”
+        const std::string imu_type = "sensor_msgs/msg/Imu";
+        const std::string pc2_type = "sensor_msgs/msg/PointCloud2";
+        const std::string img_type = "sensor_msgs/msg/Image";
+        std::map<std::string, std::string> topic_to_type;
+        for (const auto& meta : topics) {
+            topic_to_type[meta.name] = meta.type;
+        }
+
+        UNICALIB_INFO("[Ros2BagDataSource] 将加载 bag 内所有 IMU / LiDAR / 相机话题，加载后可通过 sensor_id 或话题名选择使用");
 
         // 反序列化器 (ROS2 Humble 需手动反序列化 SerializedBagMessage)
         rclcpp::Serialization<sensor_msgs::msg::PointCloud2> ser_pc;
         rclcpp::Serialization<sensor_msgs::msg::Image> ser_img;
         rclcpp::Serialization<sensor_msgs::msg::Imu> ser_imu;
 
-        // 读取消息
         bool time_window_set = (cfg_.time_window_end > cfg_.time_window_start);
         double last_time = 0.0;
 
         while (bag_reader_->has_next()) {
             auto msg = bag_reader_->read_next();
-            // SerializedBagMessage: time_stamp 为纳秒 (rcutils_time_point_value_t)
             double msg_time = static_cast<double>(msg->time_stamp) * 1e-9;
 
-            // 时间窗口过滤
             if (time_window_set) {
                 if (msg_time < cfg_.time_window_start) continue;
                 if (msg_time > cfg_.time_window_end) break;
             }
 
             last_time = std::max(last_time, msg_time);
-
             std::string topic = msg->topic_name;
+            auto it_type = topic_to_type.find(topic);
+            if (it_type == topic_to_type.end() || !msg->serialized_data) continue;
 
-            // LiDAR 数据
-            for (const auto& [sensor_id, lidar_topic] : cfg_.lidar_topics) {
-                if (topic == lidar_topic && msg->serialized_data) {
-                    rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
-                    auto cloud_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
-                    ser_pc.deserialize_message(&serialized_msg, cloud_msg.get());
-                    lidar_data_[sensor_id].push_back(parse_point_cloud2(cloud_msg));
-                    UNICALIB_TRACE("  收集 LiDAR {} 帧数: {}",
-                                 sensor_id, lidar_data_[sensor_id].size());
-                    break;
-                }
+            const std::string& type = it_type->second;
+
+            // LiDAR：所有 PointCloud2 话题
+            if (type == pc2_type) {
+                rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+                auto cloud_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
+                ser_pc.deserialize_message(&serialized_msg, cloud_msg.get());
+                lidar_data_[topic].push_back(parse_point_cloud2(cloud_msg));
+                UNICALIB_TRACE("  收集 LiDAR [{}] 帧数: {}", topic, lidar_data_[topic].size());
+                continue;
             }
 
-            // 相机数据
-            for (const auto& [sensor_id, camera_topic] : cfg_.camera_topics) {
-                if (topic == camera_topic && msg->serialized_data) {
-                    rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
-                    auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
-                    ser_img.deserialize_message(&serialized_msg, image_msg.get());
-                    camera_data_[sensor_id].push_back(parse_image(image_msg));
-                    UNICALIB_TRACE("  收集相机 {} 帧数: {}",
-                                 sensor_id, camera_data_[sensor_id].size());
-                    break;
-                }
+            // 相机：所有 Image 话题
+            if (type == img_type) {
+                rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+                auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
+                ser_img.deserialize_message(&serialized_msg, image_msg.get());
+                camera_data_[topic].push_back(parse_image(image_msg));
+                UNICALIB_TRACE("  收集相机 [{}] 帧数: {}", topic, camera_data_[topic].size());
+                continue;
             }
 
-            // IMU 数据
-            for (const auto& [sensor_id, imu_topic] : cfg_.imu_topics) {
-                if (topic == imu_topic && msg->serialized_data) {
-                    rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
-                    auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
-                    ser_imu.deserialize_message(&serialized_msg, imu_msg.get());
-                    imu_data_[sensor_id].push_back(parse_imu(imu_msg));
-                    UNICALIB_TRACE("  收集 IMU {} 帧数: {}",
-                                 sensor_id, imu_data_[sensor_id].size());
-                    break;
+            // IMU：所有 Imu 话题
+            if (type == imu_type) {
+                rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+                auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
+                ser_imu.deserialize_message(&serialized_msg, imu_msg.get());
+                imu_data_[topic].push_back(parse_imu(imu_msg));
+                if (imu_msg->header.stamp.sec == 0 && imu_msg->header.stamp.nanosec == 0) {
+                    imu_data_[topic].back().timestamp = msg_time;
                 }
+                UNICALIB_TRACE("  收集 IMU [{}] 帧数: {}", topic, imu_data_[topic].size());
+            }
+        }
+
+        // 构建“选择使用”映射：sensor_id -> 实际话题名（配置优先，否则首个有数据的话题）
+        auto pick_first = [](const std::map<std::string, std::vector<LiDARScanRos>>& data) -> std::string {
+            if (data.empty()) return {};
+            for (const auto& [k, v] : data) { if (!v.empty()) return k; }
+            return {};
+        };
+        auto pick_first_cam = [](const std::map<std::string, std::vector<CameraFrameRos>>& data) -> std::string {
+            if (data.empty()) return {};
+            for (const auto& [k, v] : data) { if (!v.empty()) return k; }
+            return {};
+        };
+        auto pick_first_imu = [](const std::map<std::string, std::vector<IMUFrameRos>>& data) -> std::string {
+            if (data.empty()) return {};
+            for (const auto& [k, v] : data) { if (!v.empty()) return k; }
+            return {};
+        };
+
+        effective_lidar_topic_.clear();
+        std::vector<std::string> missing_lidar;  // (sensor_id: topic) 用于 strict 模式报错
+        for (const auto& [sensor_id, topic] : cfg_.lidar_topics) {
+            if (!topic.empty() && lidar_data_.count(topic) && !lidar_data_.at(topic).empty()) {
+                effective_lidar_topic_[sensor_id] = topic;
+            } else {
+                if (cfg_.strict_topic_match && !topic.empty()) {
+                    missing_lidar.push_back(sensor_id + ": " + topic);
+                } else {
+                    std::string fallback = pick_first(lidar_data_);
+                    if (!fallback.empty()) {
+                        effective_lidar_topic_[sensor_id] = fallback;
+                        if (!topic.empty() && topic != fallback) {
+                            UNICALIB_WARN("[Ros2BagDataSource] LiDAR '{}' 配置话题 '{}' 无数据，已选用: {}", sensor_id, topic, fallback);
+                        }
+                    }
+                }
+            }
+        }
+        if (cfg_.lidar_topics.empty() && !lidar_data_.empty()) {
+            effective_lidar_topic_["lidar_0"] = pick_first(lidar_data_);
+        }
+
+        effective_camera_topic_.clear();
+        std::vector<std::string> missing_camera;
+        for (const auto& [sensor_id, topic] : cfg_.camera_topics) {
+            if (!topic.empty() && camera_data_.count(topic) && !camera_data_.at(topic).empty()) {
+                effective_camera_topic_[sensor_id] = topic;
+            } else {
+                if (cfg_.strict_topic_match && !topic.empty()) {
+                    missing_camera.push_back(sensor_id + ": " + topic);
+                } else {
+                    std::string fallback = pick_first_cam(camera_data_);
+                    if (!fallback.empty()) {
+                        effective_camera_topic_[sensor_id] = fallback;
+                        if (!topic.empty() && topic != fallback) {
+                            UNICALIB_WARN("[Ros2BagDataSource] 相机 '{}' 配置话题 '{}' 无数据，已选用: {}", sensor_id, topic, fallback);
+                        }
+                    }
+                }
+            }
+        }
+        if (cfg_.camera_topics.empty() && !camera_data_.empty()) {
+            effective_camera_topic_["camera_0"] = pick_first_cam(camera_data_);
+        }
+
+        effective_imu_topic_.clear();
+        std::vector<std::string> missing_imu;
+        for (const auto& [sensor_id, topic] : cfg_.imu_topics) {
+            if (!topic.empty() && imu_data_.count(topic) && !imu_data_.at(topic).empty()) {
+                effective_imu_topic_[sensor_id] = topic;
+            } else {
+                if (cfg_.strict_topic_match && !topic.empty()) {
+                    missing_imu.push_back(sensor_id + ": " + topic);
+                } else {
+                    std::string fallback = pick_first_imu(imu_data_);
+                    if (!fallback.empty()) {
+                        effective_imu_topic_[sensor_id] = fallback;
+                        if (!topic.empty() && topic != fallback) {
+                            UNICALIB_WARN("[Ros2BagDataSource] IMU '{}' 配置话题 '{}' 无数据，已选用: {}", sensor_id, topic, fallback);
+                        }
+                    }
+                }
+            }
+        }
+        if (cfg_.imu_topics.empty() && !imu_data_.empty()) {
+            effective_imu_topic_["imu_0"] = pick_first_imu(imu_data_);
+        }
+
+        if (cfg_.strict_topic_match && (!missing_lidar.empty() || !missing_camera.empty() || !missing_imu.empty())) {
+            std::string msg = "[Ros2BagDataSource] 以配置文件为准：以下配置话题在 bag 中无数据，请使配置与 bag 一致（或设置 ros2.strict_topic_match: false 允许自动回退）。";
+            if (!missing_lidar.empty()) {
+                for (const auto& s : missing_lidar) msg += " LiDAR[" + s + "]";
+            }
+            if (!missing_camera.empty()) {
+                for (const auto& s : missing_camera) msg += " 相机[" + s + "]";
+            }
+            if (!missing_imu.empty()) {
+                for (const auto& s : missing_imu) msg += " IMU[" + s + "]";
+            }
+            status_msg_ = msg;
+            UNICALIB_ERROR("{}", status_msg_);
+            return false;
+        }
+        
+        // 记录时间范围：从所有已加载话题取最小/最大时间戳
+        start_time_ = 0.0;
+        end_time_ = 0.0;
+        auto update_range = [](double& t_start, double& t_end,
+                               const std::map<std::string, std::vector<LiDARScanRos>>& data) {
+            for (const auto& [_, vec] : data) {
+                if (vec.empty()) continue;
+                if (t_start == 0.0 && t_end == 0.0) {
+                    t_start = vec.front().timestamp;
+                    t_end = vec.back().timestamp;
+                } else {
+                    t_start = std::min(t_start, vec.front().timestamp);
+                    t_end = std::max(t_end, vec.back().timestamp);
+                }
+            }
+        };
+        update_range(start_time_, end_time_, lidar_data_);
+        for (const auto& [_, frames] : camera_data_) {
+            if (frames.empty()) continue;
+            if (start_time_ == 0.0 && end_time_ == 0.0) {
+                start_time_ = frames.front().timestamp;
+                end_time_ = frames.back().timestamp;
+            } else {
+                start_time_ = std::min(start_time_, frames.front().timestamp);
+                end_time_ = std::max(end_time_, frames.back().timestamp);
+            }
+        }
+        for (const auto& [_, frames] : imu_data_) {
+            if (frames.empty()) continue;
+            if (start_time_ == 0.0 && end_time_ == 0.0) {
+                start_time_ = frames.front().timestamp;
+                end_time_ = frames.back().timestamp;
+            } else {
+                start_time_ = std::min(start_time_, frames.front().timestamp);
+                end_time_ = std::max(end_time_, frames.back().timestamp);
             }
         }
         
-        // 记录时间范围
-        if (!lidar_data_.empty()) {
-            const auto& scans = lidar_data_.begin()->second;
-            if (!scans.empty()) {
-                start_time_ = scans.front().timestamp;
-                end_time_ = scans.back().timestamp;
-            }
+        UNICALIB_INFO("[Ros2BagDataSource] 加载完成 (所有话题按话题名存储，可通过 sensor_id 或话题名选择):");
+        for (const auto& [topic, data] : lidar_data_) {
+            UNICALIB_INFO("  LiDAR [{}]: {} 帧", topic, data.size());
         }
-        
-        UNICALIB_INFO("[Ros2BagDataSource] 加载完成:");
-        for (const auto& [sensor_id, data] : lidar_data_) {
-            UNICALIB_INFO("  LiDAR {}: {} 帧", sensor_id, data.size());
+        for (const auto& [topic, data] : camera_data_) {
+            UNICALIB_INFO("  相机 [{}]: {} 帧", topic, data.size());
         }
-        for (const auto& [sensor_id, data] : camera_data_) {
-            UNICALIB_INFO("  相机 {}: {} 帧", sensor_id, data.size());
+        for (const auto& [topic, data] : imu_data_) {
+            UNICALIB_INFO("  IMU [{}]: {} 帧", topic, data.size());
         }
-        for (const auto& [sensor_id, data] : imu_data_) {
-            UNICALIB_INFO("  IMU {}: {} 帧", sensor_id, data.size());
+        for (const auto& [sensor_id, topic] : effective_lidar_topic_) {
+            UNICALIB_INFO("  选用 LiDAR  {} -> {}", sensor_id, topic);
+        }
+        for (const auto& [sensor_id, topic] : effective_camera_topic_) {
+            UNICALIB_INFO("  选用 相机  {} -> {}", sensor_id, topic);
+        }
+        for (const auto& [sensor_id, topic] : effective_imu_topic_) {
+            UNICALIB_INFO("  选用 IMU    {} -> {}", sensor_id, topic);
         }
         UNICALIB_INFO("  时间范围: {:.3f} - {:.3f} 秒", start_time_, end_time_);
         
@@ -513,38 +686,60 @@ bool Ros2BagDataSource::load() {
 
 std::vector<LiDARScanRos> Ros2BagDataSource::get_lidar_scans(
     const std::string& sensor_id) const {
+    // 支持按话题名或配置的 sensor_id 选择
     auto it = lidar_data_.find(sensor_id);
-    return (it != lidar_data_.end()) ? it->second : std::vector<LiDARScanRos>();
+    if (it != lidar_data_.end()) return it->second;
+    auto it_eff = effective_lidar_topic_.find(sensor_id);
+    if (it_eff != effective_lidar_topic_.end()) {
+        it = lidar_data_.find(it_eff->second);
+        if (it != lidar_data_.end()) return it->second;
+    }
+    return std::vector<LiDARScanRos>();
 }
 
 std::vector<CameraFrameRos> Ros2BagDataSource::get_camera_frames(
     const std::string& sensor_id) const {
     auto it = camera_data_.find(sensor_id);
-    return (it != camera_data_.end()) ? it->second : std::vector<CameraFrameRos>();
+    if (it != camera_data_.end()) return it->second;
+    auto it_eff = effective_camera_topic_.find(sensor_id);
+    if (it_eff != effective_camera_topic_.end()) {
+        it = camera_data_.find(it_eff->second);
+        if (it != camera_data_.end()) return it->second;
+    }
+    return std::vector<CameraFrameRos>();
 }
 
 std::vector<IMUFrameRos> Ros2BagDataSource::get_imu_frames(
     const std::string& sensor_id) const {
     auto it = imu_data_.find(sensor_id);
-    return (it != imu_data_.end()) ? it->second : std::vector<IMUFrameRos>();
+    if (it != imu_data_.end()) return it->second;
+    auto it_eff = effective_imu_topic_.find(sensor_id);
+    if (it_eff != effective_imu_topic_.end()) {
+        it = imu_data_.find(it_eff->second);
+        if (it != imu_data_.end()) return it->second;
+    }
+    return std::vector<IMUFrameRos>();
 }
 
 std::vector<std::string> Ros2BagDataSource::get_lidar_ids() const {
-    std::vector<std::string> ids;
-    for (const auto& [id, _] : lidar_data_) ids.push_back(id);
-    return ids;
+    std::set<std::string> ids;
+    for (const auto& [s, _] : effective_lidar_topic_) ids.insert(s);
+    for (const auto& [topic, _] : lidar_data_) ids.insert(topic);
+    return std::vector<std::string>(ids.begin(), ids.end());
 }
 
 std::vector<std::string> Ros2BagDataSource::get_camera_ids() const {
-    std::vector<std::string> ids;
-    for (const auto& [id, _] : camera_data_) ids.push_back(id);
-    return ids;
+    std::set<std::string> ids;
+    for (const auto& [s, _] : effective_camera_topic_) ids.insert(s);
+    for (const auto& [topic, _] : camera_data_) ids.insert(topic);
+    return std::vector<std::string>(ids.begin(), ids.end());
 }
 
 std::vector<std::string> Ros2BagDataSource::get_imu_ids() const {
-    std::vector<std::string> ids;
-    for (const auto& [id, _] : imu_data_) ids.push_back(id);
-    return ids;
+    std::set<std::string> ids;
+    for (const auto& [s, _] : effective_imu_topic_) ids.insert(s);
+    for (const auto& [topic, _] : imu_data_) ids.insert(topic);
+    return std::vector<std::string>(ids.begin(), ids.end());
 }
 
 // ===========================================================================
@@ -1152,6 +1347,18 @@ std::optional<CameraIntrinsics> UnifiedDataLoader::get_camera_intrinsics(
         return it->second;
     }
     return std::nullopt;
+}
+
+std::vector<std::string> UnifiedDataLoader::get_camera_ids() const {
+    if (cfg_.source_type == SourceType::FILES) {
+        std::vector<std::string> ids;
+        for (const auto& [k, _] : file_camera_data_)
+            ids.push_back(k);
+        return ids;
+    }
+    if (ros_source_)
+        return ros_source_->get_camera_ids();
+    return {};
 }
 
 bool UnifiedDataLoader::is_ready() const {
